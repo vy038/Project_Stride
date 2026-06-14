@@ -1,1 +1,1 @@
-# stride
+# Project Stride
