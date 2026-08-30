@@ -9,8 +9,8 @@ A 2-DOF robotic leg built to learn closed-loop FOC over CAN with real encoder fe
 
 Right now this repo is CAD and nothing else. No firmware, no wiring, no bring-up. This README locks in the design before any of that starts.
 
-![Stride CAD isometric](assets/stride_cad_iso.png)
-![Stride CAD front](assets/stride_cad_front.png)
+![Stride CAD isometric](<img width="657" height="805" alt="image" src="https://github.com/user-attachments/assets/cd6b38c0-7b3d-49c7-a78a-2d96d0c87323" />)
+![Stride CAD front](<img width="657" height="805" alt="image" src="https://github.com/user-attachments/assets/76dfb38e-eb79-4beb-a0b3-a90ee20fa0e5" />)
 
 ---
 
