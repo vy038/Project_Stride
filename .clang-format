@@ -1,0 +1,10 @@
+# Matches lib/cfc: 4 spaces, K&R braces, pointer on the name.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 110
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlignConsecutiveMacros: true
+AlignTrailingComments: true
+SortIncludes: true

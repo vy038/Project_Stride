@@ -1,0 +1,6 @@
+{
+  "name": "cfc",
+  "version": "0.0.0",
+  "description": "Vendored copy of vy038/cfc-cortex-m @ bfb9375 (src/ + weights/generated/). weights_nobackbone.h is overwritten by tools/train_cfc_controller.py once a controller is trained.",
+  "build": { "flags": ["-O2", "-ffp-contract=fast"] }
+}
