@@ -3,8 +3,15 @@
 #include "cfc_ctrl.h"
 #include "config.h"
 #include "drivers/uart.h"
+#include "drivers/wdg.h"
+#include <stdbool.h>
 #include "stm32f4xx_hal.h"
 #include <stdio.h>
+
+// temporary test
+#ifndef WDG_TEST
+#define WDG_TEST 0
+#endif
 
 static joint_t joint;
 static cfc_check_t cfc_check;
@@ -84,14 +91,19 @@ int main(void) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     // TODO: i2c_init + as5600_check, pwm3_init (EN low), spi_init + mcp2515_init
-    // TODO: wdg_caused_reset -> FAULT_DEADMAN
+    // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
+    bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
+    printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
 
     cfc_check = cfc_ctrl_check();
     joint_init(&joint, cfc_check.ok);
     can_node_init();
 
     // TODO: NVIC priorities: tick 0, I2C EV/ER + its DMA 1, PendSV 2, EXTI9_5 (MCP2515 INT) 3
-    // TODO: start TICK_TIM at FOC_HZ, wdg_init(WDG_TIMEOUT_MS)
+    // TODO: start TICK_TIM at FOC_HZ
+
+    // after slow init: the counter runs when this exits
+    if (wdg_init(WDG_TIMEOUT_MS) != 0) for (;;) {}
 
     for (;;) {
         // remove later: CYCCNT delta over 1000 SysTick ms should be 84,000,000
@@ -99,9 +111,25 @@ int main(void) {
         while (HAL_GetTick() == t0) {} // align to a tick edge
         t0 = HAL_GetTick();
         uint32_t c0 = DWT->CYCCNT;
-        while (HAL_GetTick() - t0 < 1000) {}
+        while (HAL_GetTick() - t0 < 1000) {
+            wdg_kick(); // the busy-wait is part of the superloop, keep feeding
+        }
         printf("cycles/1000ms: %lu\r\n", DWT->CYCCNT - c0);
-        
-        // TODO: wdg_kick, can_node_poll, i2c_recover after an I2C error
+
+        // watchdog test
+#if WDG_TEST == 1 // build with -DWDG_TEST=1: stop kicking, chip must reset
+        printf("no more kicks\r\n");
+        for (;;) {}
+#elif WDG_TEST == 2 // build with -DWDG_TEST=2: HardFault. Driver supply OFF.
+        printf("calling null\r\n");
+        ((void (*)(void))0)();
+#endif
+        // TODO: can_node_poll, i2c_recover after an I2C error
+
+        // TODO: once the tick exists, kick only if BOTH hold: this loop is running AND tick ISR is alive
+        // if (tick_count != last_seen) { 
+        //     last_seen = tick_count;
+        //     wdg_kick(); 
+        // }
     }
 }
