@@ -37,14 +37,23 @@ void PendSV_Handler(void) {
     //       hand uq / theta_e to the tick with interrupts masked for the copy.
 }
 
-// 8 MHz HSE (bypass to ST-LINK clock instead of crystal) to 84 MHz SYSCLK
-
-//   VCO in  = HSE / M       = 8 MHz / 8    = 1 MHz      (must be 1-2 MHz, lower is better)
-//   VCO out = VCO in * N    = 1 MHz * 336  = 336 MHz    (must be 100-432 MHz)
-//   SYSCLK  = VCO out / P   = 336 MHz / 4  = 84 MHz     (max 84 on F401)
-//   USB/SDIO= VCO out / Q   = 336 MHz / 7  = 48 MHz     (unused, Q just has to be legal (2-15))
-//   AHB = /1 = 84 MHz, APB1 = /2 = 42 MHz (max 42), APB2 = /1 = 84 MHz
-//   APB1 timers run at 2x APB1 = 84 MHz (42MHz x 2) because APB1 prescaler isn't 1 to 1
+// 8 MHz HSE (bypass, driven by the ST-LINK) to 84 MHz SYSCLK. Each stage has a hardware limit:
+//   VCO in  = HSE / M      = 8 MHz / 8   = 1 MHz
+//       1-2 MHz; the phase comparator needs a slow clean reference (2 is recommended for less jitter)
+//   VCO out = VCO in * N   = 1 MHz * 336 = 336 MHz
+//       100-432 MHz; the VCO only locks in this band, so it can't run at 84 directly
+//   SYSCLK  = VCO out / P  = 336 MHz / 4 = 84 MHz
+//       max 84; P is 2, 4, 6 or 8; divides the VCO back down to the CPU clock
+//   USB/SDIO= VCO out / Q  = 336 MHz / 7 = 48 MHz
+//       unused; second output of the same VCO, Q just has to be legal (2-15)
+//   AHB /1 = 84 MHz
+//       max 84; feeds the CPU, memory and DMA
+//   APB1 /2 = 42 MHz
+//       max 42, so it needs /2; slow bus for UART2, I2C1, SPI2, TIM2/3
+//   APB2 /1 = 84 MHz
+//       max 84; fast bus
+//   APB1 timers = 2 x 42 = 84 MHz
+//       timers on a bus with a prescaler other than /1 run at 2x the bus clock
 static void SystemClock_Config(void) {
     __HAL_RCC_PWR_CLK_ENABLE();
     __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1); // 84 MHz needs scale 1
