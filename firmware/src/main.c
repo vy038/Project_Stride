@@ -18,13 +18,38 @@ static cfc_check_t cfc_check;
 
 void SysTick_Handler(void) { HAL_IncTick(); }
 
+// written only by the tick, read from main
+// min/max are since boot, so main never resets them
+static volatile uint32_t tick_count;
+static volatile uint32_t isr_min = UINT32_MAX, isr_max;
+static volatile uint32_t period_min = UINT32_MAX, period_max;
+
 void TIM2_IRQHandler(void) {
-    // TODO: clear UIF
+    static uint32_t last_entry;
+    uint32_t entry = DWT->CYCCNT;
+
+    // SR bits clear on writing 0, 1s are ignored
+    TICK_TIM->SR = ~TIM_SR_UIF;
+
+    if (tick_count > 0) { // first tick has no previous entry to measure from
+        uint32_t period = entry - last_entry;
+        if (period < period_min) period_min = period;
+        if (period > period_max) period_max = period;
+    }
+    last_entry = entry;
+    tick_count++;
+
+    // TODO:
     //   as5600_get: raw from the DMA read started last tick (failed -> count toward ENC_LOST_N, hold angle)
     //   as5600_start: next read
     //   multi-turn unwrap -> joint angle -> velocity estimate -> publish via seqlock
     //   theta_e from angle (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
     //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
+
+    // grabs min and max cycles to get jitter
+    uint32_t cycles = DWT->CYCCNT - entry;
+    if (cycles < isr_min) isr_min = cycles;
+    if (cycles > isr_max) isr_max = cycles;
 }
 
 void EXTI9_5_IRQHandler(void) {
@@ -38,12 +63,12 @@ void PendSV_Handler(void) {
 }
 
 // 8 MHz HSE (bypass, driven by the ST-LINK) to 84 MHz SYSCLK. Each stage has a hardware limit:
-//   VCO in  = HSE / M      = 8 MHz / 8   = 1 MHz
+//   VCO in  = HSE / M      = 8 MHz / 4   = 2 MHz
 //       1-2 MHz; the phase comparator needs a slow clean reference (2 is recommended for less jitter)
-//   VCO out = VCO in * N   = 1 MHz * 336 = 336 MHz
-//       100-432 MHz; the VCO only locks in this band, so it can't run at 84 directly
+//   VCO out = VCO in * N   = 2 MHz * 168 = 336 MHz
+//       192-432 MHz on F401; the VCO only locks in this band, so it can't run at 84 directly
 //   SYSCLK  = VCO out / P  = 336 MHz / 4 = 84 MHz
-//       max 84; P is 2, 4, 6 or 8; divides the VCO back down to the CPU clock
+//       max 84; P is 2, 4, 6 or 8 and only 4 keeps the VCO in band (2 -> 168, 6 -> 504)
 //   USB/SDIO= VCO out / Q  = 336 MHz / 7 = 48 MHz
 //       unused; second output of the same VCO, Q just has to be legal (2-15)
 //   AHB /1 = 84 MHz
@@ -56,15 +81,15 @@ void PendSV_Handler(void) {
 //       timers on a bus with a prescaler other than /1 run at 2x the bus clock
 static void SystemClock_Config(void) {
     __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1); // 84 MHz needs scale 1
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2); // scale to 2 for <= 84 MHz
 
     RCC_OscInitTypeDef osc = {
         .OscillatorType = RCC_OSCILLATORTYPE_HSE,
         .HSEState = RCC_HSE_BYPASS,
         .PLL = {.PLLState = RCC_PLL_ON,
                 .PLLSource = RCC_PLLSOURCE_HSE,
-                .PLLM = 8,
-                .PLLN = 336,
+                .PLLM = 4,
+                .PLLN = 168,
                 .PLLP = RCC_PLLP_DIV4,
                 .PLLQ = 7},
     };
@@ -81,11 +106,26 @@ static void SystemClock_Config(void) {
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) for (;;) {}
 }
 
-// pull en pin low when configuring clock, ensures nothing runs 
+// pull both driver EN pins low before configuring anything
+// the other joint's EN mis JTAG NJTRST, so it idles high
 static void en_pin_low(void) {
-    EN_PORT->BSRR = 1u << (EN_PIN + 16); // ODR bit low first (it resets to 0 anyway)
-    GPIO_InitTypeDef g = {.Pin = 1u << EN_PIN, .Mode = GPIO_MODE_OUTPUT_PP, .Speed = GPIO_SPEED_FREQ_LOW};
+    EN_PORT->BSRR = EN_ALL_RESET; // ODR bits low first (they reset to 0 anyway)
+    GPIO_InitTypeDef g = {.Pin = (1u << EN_PIN) | (1u << OTHER_EN_PIN), .Mode = GPIO_MODE_OUTPUT_PP, .Speed = GPIO_SPEED_FREQ_LOW};
     HAL_GPIO_Init(EN_PORT, &g);
+}
+
+// TIM2 update interrupt at FOC_HZ
+// 84 MHz / (PSC+1) = 1 MHz count, 1 MHz / (ARR+1) = 5 kHz, so 200 us per tick
+static void tick_start(void) {
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    TICK_TIM->PSC = TIM_CLK_HZ / TICK_CNT_HZ - 1;
+    TICK_TIM->ARR = TICK_CNT_HZ / FOC_HZ - 1;
+    TICK_TIM->EGR = TIM_EGR_UG;  // PSC only loads on an update event, so force one
+    TICK_TIM->SR = ~TIM_SR_UIF;  // UG also set UIF, clear it or the ISR fires straight away
+    TICK_TIM->DIER = TIM_DIER_UIE;
+    NVIC_SetPriority(TIM2_IRQn, 0);
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TICK_TIM->CR1 = TIM_CR1_CEN;
 }
 
 int main(void) {
@@ -108,8 +148,8 @@ int main(void) {
     joint_init(&joint, cfc_check.ok);
     can_node_init();
 
-    // TODO: NVIC priorities: tick 0, I2C EV/ER + its DMA 1, PendSV 2, EXTI9_5 (MCP2515 INT) 3
-    // TODO: start TICK_TIM at FOC_HZ
+    // TODO: NVIC priorities: I2C EV/ER + its DMA 1, PendSV 2, EXTI9_5 (MCP2515 INT) 3
+    tick_start();
 
     // after slow init: the counter runs when this exits
     if (wdg_init(WDG_TIMEOUT_MS) != 0) for (;;) {}
@@ -120,10 +160,16 @@ int main(void) {
         while (HAL_GetTick() == t0) {} // align to a tick edge
         t0 = HAL_GetTick();
         uint32_t c0 = DWT->CYCCNT;
+        uint32_t n0 = tick_count;
         while (HAL_GetTick() - t0 < 1000) {
             wdg_kick(); // the busy-wait is part of the superloop, keep feeding
         }
-        printf("cycles/1000ms: %lu\r\n", DWT->CYCCNT - c0);
+        // use DWT->CYCCNT as the counter so it doesn't affect tick ISR (independent of tick timer)
+        uint32_t cycles = DWT->CYCCNT - c0;
+        uint32_t ticks = tick_count - n0;
+        printf("cycles/1000ms: %lu  ticks/1000ms: %lu\r\n", cycles, ticks);
+        // remove later: budget is 16800 cycles, period should sit within a few cycles of 16800
+        printf("isr cycles: %lu-%lu  period: %lu-%lu\r\n", isr_min, isr_max, period_min, period_max);
 
         // watchdog test
 #if WDG_TEST == 1 // build with -DWDG_TEST=1: stop kicking, chip must reset

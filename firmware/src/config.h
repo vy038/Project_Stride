@@ -12,6 +12,11 @@
 #define FOC_HZ      5000
 #define CFC_CTRL_HZ 500
 #define TICK_TIM    TIM2
+#define TIM_CLK_HZ  84000000 // APB1 timer clock, 2 x 42 MHz
+#define TICK_CNT_HZ 1000000  // tick timer count rate after the prescaler
+
+_Static_assert(FOC_HZ % CFC_CTRL_HZ == 0, "PendSV fires every FOC_HZ / CFC_CTRL_HZ ticks, must be whole");
+_Static_assert(TICK_CNT_HZ % FOC_HZ == 0, "tick period must be a whole number of counts");
 
 // ---------- joint behaviour ----------
 #define TRAVEL_RAD  0.5f
@@ -64,6 +69,8 @@
 #define PWM_C_PIN  0
 #define EN_PORT    GPIOB
 #define EN_PIN     5
+#define OTHER_EN_PIN 4 // hip driver EN, same port. never driven high by this build
+#define EN_ALL_RESET ((1u << (EN_PIN + 16)) | (1u << (OTHER_EN_PIN + 16))) // BSRR value clearing both
 
 #define ENC_I2C  I2C1
 #define SCL_PORT GPIOB
