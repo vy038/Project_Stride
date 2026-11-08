@@ -14,6 +14,7 @@
  * ISR or PendSV. A kick must mean "the lowest-priority code is still running",
  * which is the first thing to die when CAN, I2C recovery or a bad loop hangs.
  * If an ISR kicked, interrupts alone would keep a dead superloop looking alive.
+ * main only calls it when the tick counter has moved, so a kick proves both.
  *
  * Source of the numbers (RM0368 IWDG chapter, STM32F401xE datasheet):
  *   - LSI is nominally 32 kHz, but the datasheet spread is about 17 to 47 kHz.

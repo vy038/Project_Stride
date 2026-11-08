@@ -128,6 +128,17 @@ static void tick_start(void) {
     TICK_TIM->CR1 = TIM_CR1_CEN;
 }
 
+// kick only if this loop is running AND the tick has fired since the last kick. if either dies
+// the kicks stop and the IWDG resets the chip. a dead tick would otherwise leave PWM at its last duty
+static void kick_if_tick_alive(void) {
+    static uint32_t last_seen;
+    uint32_t now = tick_count;
+    if (now != last_seen) {
+        last_seen = now;
+        wdg_kick();
+    }
+}
+
 int main(void) {
     __HAL_RCC_GPIOB_CLK_ENABLE();
     en_pin_low();
@@ -162,7 +173,7 @@ int main(void) {
         uint32_t c0 = DWT->CYCCNT;
         uint32_t n0 = tick_count;
         while (HAL_GetTick() - t0 < 1000) {
-            wdg_kick(); // the busy-wait is part of the superloop, keep feeding
+            kick_if_tick_alive(); // the busy-wait is part of the superloop, keep feeding
         }
         // use DWT->CYCCNT as the counter so it doesn't affect tick ISR (independent of tick timer)
         uint32_t cycles = DWT->CYCCNT - c0;
@@ -178,13 +189,15 @@ int main(void) {
 #elif WDG_TEST == 2 // build with -DWDG_TEST=2: HardFault. Driver supply OFF.
         printf("calling null\r\n");
         ((void (*)(void))0)();
+#elif WDG_TEST == 3 // build with -DWDG_TEST=3: tick dies, loop keeps going, chip must still reset
+        printf("tick stopped\r\n");
+        NVIC_DisableIRQ(TIM2_IRQn);
+        for (;;) {
+            kick_if_tick_alive();
+        }
 #endif
         // TODO: can_node_poll, i2c_recover after an I2C error
 
-        // TODO: once the tick exists, kick only if BOTH hold: this loop is running AND tick ISR is alive
-        // if (tick_count != last_seen) { 
-        //     last_seen = tick_count;
-        //     wdg_kick(); 
-        // }
+        kick_if_tick_alive();
     }
 }
