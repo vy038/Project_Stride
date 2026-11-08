@@ -26,10 +26,9 @@ int wdg_init(uint32_t timeout_ms) {
     hiwdg.Instance = IWDG;
     hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
     hiwdg.Init.Reload = timeout_ms;
-    // HAL unlocks the registers, writes prescaler and reload, waits for
-    // update to cross into the LSI domain (bounded), then starts counter once init
+    // HAL starts the counter first (this also turns the LSI on in hardware), then unlocks and
+    // writes prescaler and reload, waits for them to cross into the LSI domain (bounded), reloads
     return HAL_IWDG_Init(&hiwdg) == HAL_OK ? 0 : -EIO;
-    // starting the IWDG also turns the LSI oscillator on in hardware
 }
 
 // writes reload key 0xAAAA, counter restarts from reload value
@@ -51,9 +50,9 @@ bool wdg_caused_reset(void) {
     return was_watchdog;
 }
 
-// minimal implementation, cut motor driver first for safety, then wait for watchdog to reset chip
+// minimal implementation, cut both motor drivers first for safety, then wait for watchdog to reset chip
 void HardFault_Handler(void) {
-    EN_PORT->BSRR = 1u << (EN_PIN + 16);
+    EN_PORT->BSRR = EN_ALL_RESET;
     for (;;) {
     }
 }
