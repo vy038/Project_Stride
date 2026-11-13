@@ -1,9 +1,12 @@
+#include "bldc/foc.h"
 #include "bldc/joint.h"
 #include "can/can_node.h"
 #include "cfc_ctrl.h"
 #include "config.h"
+#include "drivers/pwm3.h"
 #include "drivers/uart.h"
 #include "drivers/wdg.h"
+#include <math.h>
 #include <stdbool.h>
 #include "stm32f4xx_hal.h"
 #include <stdio.h>
@@ -12,6 +15,22 @@
 #ifndef WDG_TEST
 #define WDG_TEST 0
 #endif
+
+// temporary open-loop spin: build with -DOPENLOOP_TEST=1. motor free, off the leg, supply at 0.5 A.
+// reverse with -DOPENLOOP_W_E=-6.2831853f. 1 electrical rev/s = 51.4 deg of shaft per second,
+// so the shaft makes one full turn in 7 s
+#ifndef OPENLOOP_TEST
+#define OPENLOOP_TEST 0
+#endif
+#ifndef OPENLOOP_UQ
+#define OPENLOOP_UQ 1.0f // volts, start at 1, never above 2
+#endif
+#ifndef OPENLOOP_W_E
+#define OPENLOOP_W_E 6.2831853f // electrical rad/s, 1 rev/s
+#endif
+#define OPENLOOP_MAX_TICKS (10 * FOC_HZ) // stops itself after 10 s: it heats the motor even stalled
+
+static volatile uint32_t openloop_ticks_left; // set by main, counted down by the tick
 
 static joint_t joint;
 static cfc_check_t cfc_check;
@@ -45,6 +64,16 @@ void TIM2_IRQHandler(void) {
     //   multi-turn unwrap -> joint angle -> velocity estimate -> publish via seqlock
     //   theta_e from angle (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
     //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
+
+    // open loop: rotate the field ourselves, the rotor gets dragged along
+    if (openloop_ticks_left > 0) {
+        static float theta_e;
+        theta_e = fmodf(theta_e + OPENLOOP_W_E / FOC_HZ, 6.2831853f); // keep it small, float loses precision
+        float duty[3];
+        foc_svpwm(fminf(OPENLOOP_UQ, 2.0f), theta_e, SUPPLY_V, duty);
+        pwm3_set(duty);
+        if (--openloop_ticks_left == 0) pwm3_enable(false);
+    }
 
     // grabs min and max cycles to get jitter
     uint32_t cycles = DWT->CYCCNT - entry;
@@ -150,7 +179,8 @@ int main(void) {
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    // TODO: i2c_init + as5600_check, pwm3_init (EN low), spi_init + mcp2515_init
+    pwm3_init(); // 50% on all three, EN still low
+    // TODO: i2c_init + as5600_check, spi_init + mcp2515_init
     // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
     bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
     printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
@@ -164,6 +194,12 @@ int main(void) {
 
     // after slow init: the counter runs when this exits
     if (wdg_init(WDG_TIMEOUT_MS) != 0) for (;;) {}
+
+#if OPENLOOP_TEST
+    printf("open loop: %d mV, %d mrad/s electrical, 10 s\r\n", (int)(OPENLOOP_UQ * 1000), (int)(OPENLOOP_W_E * 1000));
+    openloop_ticks_left = OPENLOOP_MAX_TICKS; // the tick sets duties from here on
+    pwm3_enable(true);                        // breaker on last
+#endif
 
     for (;;) {
         // remove later: CYCCNT delta over 1000 SysTick ms should be 84,000,000
@@ -181,6 +217,9 @@ int main(void) {
         printf("cycles/1000ms: %lu  ticks/1000ms: %lu\r\n", cycles, ticks);
         // remove later: budget is 16800 cycles, period should sit within a few cycles of 16800
         printf("isr cycles: %lu-%lu  period: %lu-%lu\r\n", isr_min, isr_max, period_min, period_max);
+#if OPENLOOP_TEST
+        printf("open loop: %s\r\n", openloop_ticks_left ? "running" : "stopped, EN low");
+#endif
 
         // watchdog test
 #if WDG_TEST == 1 // build with -DWDG_TEST=1: stop kicking, chip must reset

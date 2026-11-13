@@ -14,6 +14,10 @@
 #define TICK_TIM    TIM2
 #define TIM_CLK_HZ  84000000 // APB1 timer clock, 2 x 42 MHz
 #define TICK_CNT_HZ 1000000  // tick timer count rate after the prescaler
+#define PWM_ARR     (TIM_CLK_HZ / (2 * PWM_HZ)) // center-aligned: period is 2 x ARR counts, 1680
+
+_Static_assert(TIM_CLK_HZ % (2 * PWM_HZ) == 0, "PWM period must be a whole number of counts");
+_Static_assert(PWM_ARR <= 0xFFFF, "TIM3 is 16-bit");
 
 _Static_assert(FOC_HZ % CFC_CTRL_HZ == 0, "PendSV fires every FOC_HZ / CFC_CTRL_HZ ticks, must be whole");
 _Static_assert(TICK_CNT_HZ % FOC_HZ == 0, "tick period must be a whole number of counts");
