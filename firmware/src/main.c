@@ -3,9 +3,12 @@
 #include "can/can_node.h"
 #include "cfc_ctrl.h"
 #include "config.h"
+#include "drivers/as5600.h"
+#include "drivers/i2c.h"
 #include "drivers/pwm3.h"
 #include "drivers/uart.h"
 #include "drivers/wdg.h"
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include "stm32f4xx_hal.h"
@@ -43,6 +46,11 @@ static volatile uint32_t tick_count;
 static volatile uint32_t isr_min = UINT32_MAX, isr_max;
 static volatile uint32_t period_min = UINT32_MAX, period_max;
 
+// encoder, written only by the tick. raw holds the last good reading on a miss
+static volatile uint16_t enc_raw;
+static volatile bool enc_lost;
+static volatile uint32_t enc_fails, enc_lost_events, enc_start_max;
+
 void TIM2_IRQHandler(void) {
     static uint32_t last_entry;
     uint32_t entry = DWT->CYCCNT;
@@ -58,10 +66,30 @@ void TIM2_IRQHandler(void) {
     last_entry = entry;
     tick_count++;
 
+    // encoder: collect the read started last tick, then start the next, so reads never overlap
+    static uint32_t fail_run;
+    uint16_t raw;
+    int r = as5600_get(&raw);
+    if (r == 0) {
+        enc_raw = raw;
+        fail_run = 0;
+        enc_lost = false;
+    } else if (r != -EAGAIN) { // -EAGAIN: nothing was started yet, not a failure
+        enc_fails++;           // includes a read still running a tick later
+        if (fail_run < ENC_LOST_N && ++fail_run == ENC_LOST_N) {
+            enc_lost = true;
+            enc_lost_events++;
+        }
+    }
+    if (r != -EINPROGRESS) { // never start over a read that's still running
+        uint32_t t = DWT->CYCCNT;
+        as5600_start();
+        uint32_t c = DWT->CYCCNT - t;
+        if (c > enc_start_max) enc_start_max = c;
+    }
+
     // TODO:
-    //   as5600_get: raw from the DMA read started last tick (failed -> count toward ENC_LOST_N, hold angle)
-    //   as5600_start: next read
-    //   multi-turn unwrap -> joint angle -> velocity estimate -> publish via seqlock
+    //   joint angle -> velocity estimate -> publish via seqlock
     //   theta_e from angle (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
     //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
 
@@ -168,6 +196,13 @@ static void kick_if_tick_alive(void) {
     }
 }
 
+// everything the superloop must do every pass, including inside temporary busy-waits
+static uint32_t i2c_recoveries;
+static void superloop_service(void) {
+    kick_if_tick_alive();
+    if (i2c_recover() == 1) i2c_recoveries++;
+}
+
 int main(void) {
     __HAL_RCC_GPIOB_CLK_ENABLE();
     en_pin_low();
@@ -180,7 +215,14 @@ int main(void) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     pwm3_init(); // 50% on all three, EN still low
-    // TODO: i2c_init + as5600_check, spi_init + mcp2515_init
+
+    // blocking boot check, before the tick starts its own reads
+    uint8_t agc = 0;
+    int enc_check = i2c_init();
+    if (enc_check == 0) enc_check = as5600_check(&agc);
+    printf("as5600: %s (err %d), agc %u of %u\r\n", enc_check == 0 ? "ok" : "FAILED, never enable", enc_check, agc,
+           AS5600_AGC_MAX);
+    // TODO: refuse joint_enable when enc_check != 0, spi_init + mcp2515_init
     // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
     bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
     printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
@@ -209,7 +251,7 @@ int main(void) {
         uint32_t c0 = DWT->CYCCNT;
         uint32_t n0 = tick_count;
         while (HAL_GetTick() - t0 < 1000) {
-            kick_if_tick_alive(); // the busy-wait is part of the superloop, keep feeding
+            superloop_service(); // the busy-wait is part of the superloop
         }
         // use DWT->CYCCNT as the counter so it doesn't affect tick ISR (independent of tick timer)
         uint32_t cycles = DWT->CYCCNT - c0;
@@ -217,6 +259,10 @@ int main(void) {
         printf("cycles/1000ms: %lu  ticks/1000ms: %lu\r\n", cycles, ticks);
         // remove later: budget is 16800 cycles, period should sit within a few cycles of 16800
         printf("isr cycles: %lu-%lu  period: %lu-%lu\r\n", isr_min, isr_max, period_min, period_max);
+        i2c_timing_t it = i2c_last_timing();
+        printf("enc raw %u  fails %lu  lost %d (%lu times)  recoveries %lu\r\n", enc_raw, enc_fails, enc_lost,
+               enc_lost_events, i2c_recoveries);
+        printf("i2c read %lu cyc, isr %lu cyc, start max %lu cyc\r\n", it.xfer_cycles, it.isr_cycles, enc_start_max);
 #if OPENLOOP_TEST
         printf("open loop: %s\r\n", openloop_ticks_left ? "running" : "stopped, EN low");
 #endif
@@ -235,8 +281,8 @@ int main(void) {
             kick_if_tick_alive();
         }
 #endif
-        // TODO: can_node_poll, i2c_recover after an I2C error
+        // TODO: can_node_poll
 
-        kick_if_tick_alive();
+        superloop_service();
     }
 }

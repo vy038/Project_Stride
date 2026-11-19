@@ -36,7 +36,13 @@ _Static_assert(TICK_CNT_HZ % FOC_HZ == 0, "tick period must be a whole number of
 // ---------- encoder ----------
 #define I2C_HZ         400000
 #define I2C_TIMEOUT_US 2000
-#define ENC_LOST_N     10
+// blind time before encoder-lost. at the 10 rad/s limit a 10 ms stale angle is 0.1 rad, 0.7 rad
+// (40 deg) electrical, so torque keeps the right sign. long enough to ride through one recovery
+#define ENC_LOST_MS    10
+#define ENC_LOST_N     (ENC_LOST_MS * FOC_HZ / 1000) // consecutive failed tick reads, 50 at 5 kHz
+#define I2C_RECOVER_MS 50 // min time between recovery attempts, so a dead sensor can't spin the loop
+
+_Static_assert(ENC_LOST_MS * FOC_HZ % 1000 == 0, "ENC_LOST_MS must be a whole number of ticks");
 
 // ---------- safety ----------
 #define WDG_TIMEOUT_MS  150
