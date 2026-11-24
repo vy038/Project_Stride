@@ -1,5 +1,7 @@
 #include "bldc/calib.h"
 #include "bldc/foc.h"
+#include "bldc/joint.h"
+#include "can/can_proto.h"
 #include "bldc/pid.h"
 #include "bldc/vel.h"
 #include "ring.h"
@@ -226,6 +228,106 @@ static void test_calib_stuck_rotor_fails(void) {
     TEST_ASSERT_EQUAL_INT(-EIO, run_calib(&p, &c));
 }
 
+// ---------- joint ----------
+// enabled joint in CLOSED_PID at angle a, calibration skipped
+static joint_t joint_closed(float a) {
+    joint_t j;
+    joint_init(&j, true, true);
+    j.calibrated = true;
+    joint_step(&j, a, 0.0f);
+    TEST_ASSERT_EQUAL_INT(0, joint_enable(&j));
+    TEST_ASSERT_EQUAL_INT(JOINT_CLOSED_PID, j.state);
+    return j;
+}
+
+static void test_joint_enable_guards(void) {
+    joint_t j;
+    joint_init(&j, true, true);
+    TEST_ASSERT_EQUAL_INT(-ERANGE, joint_enable(&j)); // no angle yet
+    joint_step(&j, TRAVEL_RAD + 0.1f, 0.0f);
+    TEST_ASSERT_EQUAL_INT(-ERANGE, joint_enable(&j));
+    joint_step(&j, -TRAVEL_RAD - 0.1f, 0.0f);
+    TEST_ASSERT_EQUAL_INT(-ERANGE, joint_enable(&j));
+    TEST_ASSERT_EQUAL_INT(JOINT_IDLE, j.state);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, j.uq);
+
+    joint_init(&j, true, false); // boot encoder check failed
+    joint_step(&j, 0.0f, 0.0f);
+    TEST_ASSERT_EQUAL_INT(-ENODEV, joint_enable(&j));
+
+    joint_init(&j, true, true); // first enable calibrates
+    joint_step(&j, 0.1f, 0.0f);
+    TEST_ASSERT_EQUAL_INT(0, joint_enable(&j));
+    TEST_ASSERT_EQUAL_INT(JOINT_CALIBRATING, j.state);
+}
+
+static void test_joint_bumpless_enable(void) {
+    joint_t j = joint_closed(0.3f);
+    TEST_ASSERT_EQUAL_FLOAT(0.3f, j.target); // holds where it is
+    joint_step(&j, 0.3f, 0.0f);
+    // the feedforward holds gravity from the first step, the PID adds nothing at zero error
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, GRAV_K * sinf(0.3f + GRAV_PHI), j.uq);
+    TEST_ASSERT_TRUE(GRAV_K != 0.0f); // native env sets it, or this proves nothing
+}
+
+static void test_joint_target_and_vlimit_clamp(void) {
+    joint_t j = joint_closed(0.0f);
+    TEST_ASSERT_EQUAL_INT(0, joint_set_target(&j, 2.0f));
+    TEST_ASSERT_EQUAL_FLOAT(TRAVEL_RAD, j.target);
+    TEST_ASSERT_EQUAL_INT(-EINVAL, joint_set_target(&j, NAN));
+    TEST_ASSERT_EQUAL_FLOAT(TRAVEL_RAD, j.target);
+
+    TEST_ASSERT_EQUAL_INT(0, joint_set_vlimit(&j, 100.0f));
+    TEST_ASSERT_EQUAL_FLOAT(CLOSEDLOOP_V, j.uq_limit);
+    TEST_ASSERT_EQUAL_INT(0, joint_set_vlimit(&j, 0.0f));
+    TEST_ASSERT_EQUAL_FLOAT(VLIMIT_MIN_V, j.uq_limit);
+    TEST_ASSERT_EQUAL_INT(-EINVAL, joint_set_vlimit(&j, INFINITY));
+    for (int i = 0; i < 1000; i++) {
+        joint_step(&j, -TRAVEL_RAD, 0.0f); // big error held: integral and output pinned
+        TEST_ASSERT_TRUE(fabsf(j.uq) <= VLIMIT_MIN_V);
+    }
+}
+
+static void test_joint_fault_zeroes_uq(void) {
+    joint_t j = joint_closed(0.0f);
+    joint_set_target(&j, 0.4f);
+    for (int i = 0; i < 50; i++) joint_step(&j, 0.0f, 0.0f);
+    TEST_ASSERT_TRUE(j.uq > 0.1f);
+    joint_step(&j, NAN, 0.0f);
+    TEST_ASSERT_EQUAL_INT(JOINT_FAULT, j.state);
+    TEST_ASSERT_TRUE(j.faults & FAULT_ENCODER_LOST);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, j.uq);
+    joint_step(&j, 0.0f, 0.0f); // stays off with a good angle again
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, j.uq);
+
+    j = joint_closed(0.0f);
+    joint_step(&j, 0.0f, INFINITY);
+    TEST_ASSERT_EQUAL_INT(JOINT_FAULT, j.state);
+}
+
+static void test_joint_cfc_fallback_bumpless(void) {
+    joint_t j = joint_closed(0.0f);
+    TEST_ASSERT_EQUAL_INT(0, joint_set_cfc(&j, true));
+    TEST_ASSERT_EQUAL_INT(JOINT_CLOSED_CFC, j.state);
+    joint_step(&j, 0.1f, 0.0f);
+    float uq_cfc = j.uq;
+    // error past CFC_MAX_ERR, velocity already at what the angle loop asks: the PID must carry on from
+    // the CfC's uq, not jump
+    float err = CFC_MAX_ERR + 0.05f;
+    float vel = fminf(PID_ANGLE_P * err, VEL_LIMIT);
+    joint_step(&j, j.target - err, vel);
+    TEST_ASSERT_EQUAL_INT(JOINT_CLOSED_PID, j.state);
+    TEST_ASSERT_EQUAL_UINT32(1, j.cfc_fallbacks);
+    TEST_ASSERT_FLOAT_WITHIN(1e-4f, uq_cfc, j.uq);
+
+    joint_t k;
+    joint_init(&k, false, true);
+    k.calibrated = true;
+    joint_step(&k, 0.0f, 0.0f);
+    joint_enable(&k);
+    TEST_ASSERT_EQUAL_INT(-ENOTSUP, joint_set_cfc(&k, true)); // golden check failed
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_pid_step);
@@ -240,5 +342,10 @@ int main(void) {
     RUN_TEST(test_vel_tracks_quantised_sine);
     RUN_TEST(test_calib_fake_plant);
     RUN_TEST(test_calib_stuck_rotor_fails);
+    RUN_TEST(test_joint_enable_guards);
+    RUN_TEST(test_joint_bumpless_enable);
+    RUN_TEST(test_joint_target_and_vlimit_clamp);
+    RUN_TEST(test_joint_fault_zeroes_uq);
+    RUN_TEST(test_joint_cfc_fallback_bumpless);
     return UNITY_END();
 }

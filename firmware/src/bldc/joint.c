@@ -9,10 +9,11 @@
 
 static float clampf(float x, float lim) { return fminf(fmaxf(x, -lim), lim); }
 
-void joint_init(joint_t *j, bool cfc_ok) {
+void joint_init(joint_t *j, bool cfc_ok, bool enc_ok) {
     *j = (joint_t){
         .state = JOINT_IDLE,
         .cfc_ok = cfc_ok,
+        .enc_ok = enc_ok,
         .angle = NAN,
         .uq_limit = CLOSEDLOOP_V,
         .pid_angle = {.kp = PID_ANGLE_P, .out_limit = VEL_LIMIT},
@@ -21,16 +22,21 @@ void joint_init(joint_t *j, bool cfc_ok) {
     };
 }
 
+// voltage that holds the leg against gravity at this angle, so the integral doesn't have to find it
+static float grav_ff(float angle) { return GRAV_K * sinf(angle + GRAV_PHI); }
+
 static void enter_pid(joint_t *j) {
     pid_reset(&j->pid_angle);
     pid_reset(&j->pid_vel);
-    j->pid_vel.integral = clampf(j->uq, j->pid_vel.i_limit);
-    j->pid_vel.prev_out = j->uq;
+    // the PID's share of the current uq, so pid + feedforward continues from it with no jump
+    j->pid_vel.integral = clampf(j->uq - grav_ff(j->angle), j->pid_vel.i_limit);
+    j->pid_vel.prev_out = j->pid_vel.integral;
     j->state = JOINT_CLOSED_PID;
 }
 
 void joint_step(joint_t *j, float angle, float vel) {
     j->angle = angle;
+    j->vel_sp = 0.0f;
     if (j->state == JOINT_IDLE || j->state == JOINT_FAULT) {
         j->uq = 0.0f;
         return;
@@ -46,7 +52,7 @@ void joint_step(joint_t *j, float angle, float vel) {
             joint_fault(j, FAULT_CALIB_FAILED);
         } else if (r == CALIB_DONE) {
             j->calibrated = true;
-            j->uq = 0.0f;
+            j->uq = grav_ff(angle); // start already holding gravity, the integral starts at 0
             j->target = clampf(angle, TRAVEL_RAD);
             enter_pid(j);
         }
@@ -67,17 +73,19 @@ void joint_step(joint_t *j, float angle, float vel) {
         enter_pid(j);
     }
 
-    float vel_sp = pid_step(&j->pid_angle, err, CTRL_DT);
-    j->uq = clampf(pid_step(&j->pid_vel, vel_sp - vel, CTRL_DT), j->uq_limit);
+    j->vel_sp = pid_step(&j->pid_angle, err, CTRL_DT);
+    j->uq = clampf(pid_step(&j->pid_vel, j->vel_sp - vel, CTRL_DT) + grav_ff(angle), j->uq_limit);
 }
 
 int joint_enable(joint_t *j) {
     if (j->state != JOINT_IDLE && j->state != JOINT_FAULT) return 0;
+    if (!j->enc_ok) return -ENODEV;
     if (!(fabsf(j->angle) <= TRAVEL_RAD)) return -ERANGE;
     j->faults = 0;
     j->uq = 0.0f;
     j->target = j->angle;
     if (j->calibrated) {
+        j->uq = grav_ff(j->angle); // same as after calibration
         enter_pid(j);
     } else {
         calib_start(&j->cal);

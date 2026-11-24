@@ -3,6 +3,7 @@
 #include "bldc/joint.h"
 #include "bldc/vel.h"
 #include "can/can_node.h"
+#include "can/can_proto.h"
 #include "cfc_ctrl.h"
 #include "config.h"
 #include "drivers/as5600.h"
@@ -10,6 +11,7 @@
 #include "drivers/pwm3.h"
 #include "drivers/uart.h"
 #include "drivers/wdg.h"
+#include "ring.h"
 #include "seqlock.h"
 #include <errno.h>
 #include <math.h>
@@ -46,11 +48,32 @@
 #endif
 _Static_assert(!(OPENLOOP_TEST && COMMUTATE_TEST), "one motor test at a time");
 
+// temporary leg test, build with -DJOINT_TEST=1 (hold zero) or 2 (also step +-0.15 rad through zero
+// every 2 s). SUPPORT THE LEG: any fault drops the knee ~70 deg. enables 3 s after boot, off after 60 s
+#ifndef JOINT_TEST
+#define JOINT_TEST 0
+#endif
+_Static_assert(!(JOINT_TEST && (OPENLOOP_TEST || COMMUTATE_TEST)), "one motor test at a time");
+
+// temporary: busy-wait this long in every PendSV, standing in for the ~168 us CfC step
+#ifndef PENDSV_LOAD_US
+#define PENDSV_LOAD_US 0
+#endif
+
 static volatile uint32_t openloop_ticks_left, commutate_ticks_left; // set by main, counted down by the tick
 static volatile int commutate_state = CALIB_RUNNING; // CALIB_DONE once spinning, < 0 calibration failed
 static volatile float cal_dir, cal_zero;
 
+// PendSV owns the joint once the tick runs. everyone else sends it commands through cmd_ring
+// (superloop pushes, PendSV pops, lock-free single producer/consumer) and reads ctrl_telem
 static joint_t joint;
+typedef enum { JCMD_ENABLE, JCMD_DISABLE, JCMD_TARGET, JCMD_VLIMIT, JCMD_CFC } jcmd_op_t;
+typedef struct {
+    jcmd_op_t op;
+    float arg;
+} joint_cmd_t;
+static joint_cmd_t cmd_buf[8];
+static ring_t cmd_ring;
 static cfc_check_t cfc_check;
 
 void SysTick_Handler(void) { HAL_IncTick(); }
@@ -64,7 +87,7 @@ static volatile uint32_t period_min = UINT32_MAX, period_max;
 // encoder telemetry. the tick is the only writer, lower priorities read it with seqlock_read.
 // on a miss raw/angle hold the last good reading; angle is NAN until the first one
 typedef struct {
-    float angle, vel; // rad, rad/s
+    float angle; // rad
     uint32_t fails;
     uint16_t raw;
     bool lost;
@@ -72,6 +95,35 @@ typedef struct {
 static enc_telem_t enc_telem;
 static seqlock_t enc_lock;
 static volatile uint32_t enc_lost_events, enc_start_max;
+
+// PendSV -> tick. the tick outranks PendSV, so a seqlock would spin forever if the tick caught a
+// write half done; PendSV masks interrupts for the copy instead. the tick just reads it
+typedef struct {
+    calib_t cal;
+    float uq, theta_e; // theta_e only used while calibrating, after that it comes from the encoder
+    bool calibrating, en;
+} drive_t;
+static drive_t drive;
+
+// PendSV -> superloop, for prints. here the reader is lower priority, so a seqlock works
+typedef struct {
+    float vel, vel_sp, uq, target;
+    uint8_t state, faults;
+    int8_t cmd_err; // result of the last command, 0 or -errno
+} ctrl_telem_t;
+static ctrl_telem_t ctrl_telem;
+static seqlock_t ctrl_lock;
+static volatile uint32_t pendsv_count, pendsv_period_min = UINT32_MAX, pendsv_period_max, pendsv_max;
+
+// step-response recorder. PendSV appends one row per run, the superloop dumps it once full.
+// printing from PendSV would block it for ms per line and break the timing being measured
+#define REC_N (4 * CFC_CTRL_HZ) // 4 s, 32 KB
+typedef struct {
+    uint32_t n; // outer-loop runs since boot
+    float vel_sp, vel, uq;
+} rec_row_t;
+static rec_row_t rec[REC_N];
+static volatile uint32_t rec_len; // REC_N means full and waiting to be dumped
 
 void TIM2_IRQHandler(void) {
     static uint32_t last_entry;
@@ -113,14 +165,28 @@ void TIM2_IRQHandler(void) {
         if (c > enc_start_max) enc_start_max = c;
     }
 
-    // velocity at the outer-loop rate, its window and filter assume that dt
-    // TODO: move into PendSV with the outer loop
-    static vel_t vel;
+    seqlock_write(&enc_lock, &enc_telem, &e, sizeof e);
+
+    // outer loop every 10th tick: PendSV runs as soon as this handler returns, on this tick's angle
     static uint32_t ctrl_div;
     bool ctrl_tick = ++ctrl_div == FOC_HZ / CFC_CTRL_HZ;
-    if (ctrl_tick) ctrl_div = 0;
-    if (ctrl_tick && isfinite(e.angle)) e.vel = vel_step(&vel, e.angle);
-    seqlock_write(&enc_lock, &enc_telem, &e, sizeof e);
+    if (ctrl_tick) {
+        ctrl_div = 0;
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+    }
+
+    // commutate every tick from the fresh angle; uq only changes at 500 Hz
+    static bool en;
+    if (drive.en && isfinite(e.angle)) {
+        float th = drive.calibrating ? drive.theta_e : calib_theta_e(&drive.cal, e.angle);
+        float duty[3];
+        foc_svpwm(drive.uq, th, SUPPLY_V, duty);
+        pwm3_set(duty);
+    }
+    if (drive.en != en) { // EN after the first duties, off before anything else
+        en = drive.en;
+        pwm3_enable(en);
+    }
 
 #if COMMUTATE_TEST
     if (commutate_ticks_left > 0) {
@@ -154,10 +220,6 @@ void TIM2_IRQHandler(void) {
     }
 #endif
 
-    // TODO:
-    //   calib_theta_e(angle) (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
-    //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
-
     // open loop: rotate the field ourselves, the rotor gets dragged along
     if (openloop_ticks_left > 0) {
         static float theta_e;
@@ -179,9 +241,63 @@ void EXTI9_5_IRQHandler(void) {
     can_node_on_int();
 }
 
+// outer loop at CFC_CTRL_HZ, pended by the tick. priority 2, so the tick and I2C preempt it
 void PendSV_Handler(void) {
-    // TODO: seqlock_read the telemetry, joint_step(&joint, angle, vel),
-    //       hand uq / theta_e to the tick with interrupts masked for the copy.
+    static uint32_t last_entry;
+    uint32_t entry = DWT->CYCCNT;
+    if (pendsv_count > 0) {
+        uint32_t period = entry - last_entry;
+        if (period < pendsv_period_min) pendsv_period_min = period;
+        if (period > pendsv_period_max) pendsv_period_max = period;
+    }
+    last_entry = entry;
+    pendsv_count++;
+
+    static int8_t cmd_err;
+    joint_cmd_t cmd;
+    while (ring_pop(&cmd_ring, &cmd)) {
+        switch (cmd.op) {
+        case JCMD_ENABLE: cmd_err = (int8_t)joint_enable(&joint); break;
+        case JCMD_DISABLE: joint_disable(&joint); cmd_err = 0; break;
+        case JCMD_TARGET: cmd_err = (int8_t)joint_set_target(&joint, cmd.arg); break;
+        case JCMD_VLIMIT: cmd_err = (int8_t)joint_set_vlimit(&joint, cmd.arg); break;
+        case JCMD_CFC: cmd_err = (int8_t)joint_set_cfc(&joint, cmd.arg != 0.0f); break;
+        }
+    }
+
+    enc_telem_t e;
+    seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
+    static vel_t vs;
+    float vel = isfinite(e.angle) ? vel_step(&vs, e.angle) : NAN;
+    if (e.lost) joint_fault(&joint, FAULT_ENCODER_LOST);
+    joint_step(&joint, e.angle, vel);
+
+    bool active = joint.state != JOINT_IDLE && joint.state != JOINT_FAULT;
+    drive_t d = {.cal = joint.cal, .uq = joint.uq, .theta_e = joint.theta_e,
+                 .calibrating = joint.state == JOINT_CALIBRATING, .en = active};
+    __disable_irq(); // a few cycles; the tick waits at most this long
+    drive = d;
+    __enable_irq();
+
+    ctrl_telem_t t = {.vel = vel, .vel_sp = joint.vel_sp, .uq = joint.uq, .target = joint.target,
+                      .state = joint.state, .faults = joint.faults, .cmd_err = cmd_err};
+    seqlock_write(&ctrl_lock, &ctrl_telem, &t, sizeof t);
+
+    // record from each start of closed loop until the buffer is full; dumping frees it again
+    static bool was_closed;
+    bool closed = joint.state == JOINT_CLOSED_PID || joint.state == JOINT_CLOSED_CFC;
+    if (closed && !was_closed && rec_len == 0) rec_len = 1;
+    was_closed = closed;
+    if (rec_len > 0 && rec_len <= REC_N) {
+        rec[rec_len - 1] = (rec_row_t){pendsv_count, joint.vel_sp, vel, joint.uq};
+        rec_len++;
+    }
+
+#if PENDSV_LOAD_US
+    while (DWT->CYCCNT - entry < PENDSV_LOAD_US * (TIM_CLK_HZ / 1000000)) {}
+#endif
+    uint32_t c = DWT->CYCCNT - entry;
+    if (c > pendsv_max) pendsv_max = c;
 }
 
 // 8 MHz HSE (bypass, driven by the ST-LINK) to 84 MHz SYSCLK. Each stage has a hardware limit:
@@ -264,11 +380,60 @@ static void kick_if_tick_alive(void) {
 // for printing floats without float printf. NAN prints as 0
 static long milli(float x) { return isfinite(x) ? lroundf(x * 1000.0f) : 0; }
 
+// dump the recorder as CSV once full. blocking is fine here, but keep kicking between lines
+static void rec_dump(void) {
+    if (rec_len <= REC_N) return;
+    printf("rec: t_ms,vel_sp_mrad_s,vel_mrad_s,uq_mv\r\n");
+    for (uint32_t i = 0; i < REC_N; i++) {
+        const rec_row_t *r = &rec[i];
+        printf("%lu,%ld,%ld,%ld\r\n", (r->n - rec[0].n) * (1000 / CFC_CTRL_HZ), milli(r->vel_sp), milli(r->vel),
+               milli(r->uq));
+        kick_if_tick_alive();
+    }
+    printf("rec: end\r\n");
+    rec_len = 0;
+}
+
+// returns false if the ring is full (PendSV not running)
+static inline bool joint_cmd(jcmd_op_t op, float arg) { return ring_push(&cmd_ring, &(joint_cmd_t){op, arg}); }
+
+#if JOINT_TEST
+static void joint_test_service(void) {
+    static uint32_t next_ms = 3000, step;
+    uint32_t now = HAL_GetTick();
+    if (now < next_ms || next_ms == UINT32_MAX) return;
+    ctrl_telem_t c;
+    seqlock_read(&ctrl_lock, &c, &ctrl_telem, sizeof c);
+    if (now >= 63000) {
+        joint_cmd(JCMD_DISABLE, 0);
+        printf("joint test: 60 s up, disabled\r\n");
+        next_ms = UINT32_MAX;
+    } else if (c.state == JOINT_FAULT) { // never re-enable after a fault, reset the board instead
+        printf("joint test: FAULT 0x%02x, stays off\r\n", c.faults);
+        next_ms = UINT32_MAX;
+    } else if (c.state == JOINT_IDLE) { // refused, e.g. outside travel: move it near zero, it retries
+        if (c.cmd_err) printf("joint test: enable refused (err %d), retrying\r\n", c.cmd_err);
+        joint_cmd(JCMD_ENABLE, 0);
+        next_ms = now + 1000;
+    } else if (JOINT_TEST == 2 && c.state == JOINT_CLOSED_PID) {
+        static const float seq[] = {0.15f, 0.0f, -0.15f, 0.0f};
+        joint_cmd(JCMD_TARGET, seq[step++ % 4]);
+        next_ms = now + 2000;
+    } else {
+        next_ms = now + 100;
+    }
+}
+#endif
+
 // everything the superloop must do every pass, including inside temporary busy-waits
 static uint32_t i2c_recoveries;
 static void superloop_service(void) {
     kick_if_tick_alive();
     if (i2c_recover() == 1) i2c_recoveries++;
+    rec_dump();
+#if JOINT_TEST
+    joint_test_service();
+#endif
 }
 
 int main(void) {
@@ -290,16 +455,18 @@ int main(void) {
     if (enc_check == 0) enc_check = as5600_check(&agc);
     printf("as5600: %s (err %d), agc %u of %u\r\n", enc_check == 0 ? "ok" : "FAILED, never enable", enc_check, agc,
            AS5600_AGC_MAX);
-    // TODO: refuse joint_enable when enc_check != 0, spi_init + mcp2515_init
+    // TODO: spi_init + mcp2515_init
     // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
     bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
     printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
 
     cfc_check = cfc_ctrl_check();
-    joint_init(&joint, cfc_check.ok);
+    joint_init(&joint, cfc_check.ok, enc_check == 0);
+    ring_init(&cmd_ring, cmd_buf, 8, sizeof cmd_buf[0]);
     can_node_init();
 
-    // TODO: NVIC priorities: I2C EV/ER + its DMA 1, PendSV 2, EXTI9_5 (MCP2515 INT) 3
+    // TODO: EXTI9_5 (MCP2515 INT) 3
+    NVIC_SetPriority(PendSV_IRQn, 2); // below the tick (0) and I2C (1)
     tick_start();
 
     // after slow init: the counter runs when this exits
@@ -339,7 +506,12 @@ int main(void) {
             sum += d;
             sumsq += (uint64_t)((int64_t)d * d);
             n++;
-            if (ms % 100 == 0) printf("angle %ld mrad  vel %ld mrad/s\r\n", milli(e.angle), milli(e.vel));
+            if (ms % 100 == 0) {
+                ctrl_telem_t c;
+                seqlock_read(&ctrl_lock, &c, &ctrl_telem, sizeof c);
+                printf("angle %ld mrad  target %ld  vel %ld mrad/s  uq %ld mV  state %u faults 0x%02x\r\n",
+                       milli(e.angle), milli(c.target), milli(c.vel), milli(c.uq), c.state, c.faults);
+            }
         }
         // std of raw in counts, only meaningful with the shaft still
         float mean = (float)sum / n;
@@ -350,6 +522,9 @@ int main(void) {
         printf("cycles/1000ms: %lu  ticks/1000ms: %lu\r\n", cycles, ticks);
         // remove later: budget is 16800 cycles, period should sit within a few cycles of 16800
         printf("isr cycles: %lu-%lu  period: %lu-%lu\r\n", isr_min, isr_max, period_min, period_max);
+        // period should sit near 168000 (2 ms); max cycles includes time the tick preempted it
+        printf("pendsv: %lu runs  period %lu-%lu  max %lu cyc\r\n", pendsv_count, pendsv_period_min,
+               pendsv_period_max, pendsv_max);
         i2c_timing_t it = i2c_last_timing();
         printf("enc raw %u  noise %ld mcounts (%lu samples)  fails %lu  lost %d (%lu times)  recoveries %lu\r\n",
                e.raw, milli(noise), n, e.fails, e.lost, enc_lost_events, i2c_recoveries);
