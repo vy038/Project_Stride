@@ -35,6 +35,18 @@ _Static_assert(TICK_CNT_HZ % FOC_HZ == 0, "tick period must be a whole number of
 #define PID_VEL_P    0.2f
 #define PID_VEL_I    2.0f
 #define PID_VEL_RAMP 1000.0f
+// the bring-up's velocity PI was clamped at +-2 V, not CLOSEDLOOP_V: SimpleFOC copied voltage_limit into
+// PID_velocity.limit at motor.init(), while voltage_limit was still OPENLOOP_V (2 V). integral and output
+#define PID_VEL_LIMIT 2.0f
+
+// gravity feedforward added to the PID's uq: GRAV_K * sin(angle + GRAV_PHI). measured on the leg with
+// -DJOINT_TEST=3, 0 until then. the CfC gets none, it learned gravity from sin/cos of the angle
+#ifndef GRAV_K
+#define GRAV_K 0.0f // volts
+#endif
+#ifndef GRAV_PHI
+#define GRAV_PHI 0.0f // rad, the zero pose isn't necessarily vertical
+#endif
 
 // ---------- encoder ----------
 #define I2C_HZ         400000

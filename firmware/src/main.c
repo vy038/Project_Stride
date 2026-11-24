@@ -48,8 +48,8 @@
 #endif
 _Static_assert(!(OPENLOOP_TEST && COMMUTATE_TEST), "one motor test at a time");
 
-// temporary leg test, build with -DJOINT_TEST=1 (hold zero) or 2 (also step +-0.15 rad through zero
-// every 2 s). SUPPORT THE LEG: any fault drops the knee ~70 deg. enables 3 s after boot, off after 60 s
+// temporary leg test, build with -DJOINT_TEST=1 (hold zero), 2 (also step +-0.15 rad through zero
+// every 2 s) or 3 (gravity sweep: hold -0.4..0.4..-0.4 rad, 3 s each, print the mean uq per angle). SUPPORT THE LEG: any fault drops the knee ~70 deg. enables 3 s after boot, off after 60 s
 #ifndef JOINT_TEST
 #define JOINT_TEST 0
 #endif
@@ -117,10 +117,10 @@ static volatile uint32_t pendsv_count, pendsv_period_min = UINT32_MAX, pendsv_pe
 
 // step-response recorder. PendSV appends one row per run, the superloop dumps it once full.
 // printing from PendSV would block it for ms per line and break the timing being measured
-#define REC_N (4 * CFC_CTRL_HZ) // 4 s, 32 KB
+#define REC_N (4 * CFC_CTRL_HZ) // 4 s, 40 KB
 typedef struct {
     uint32_t n; // outer-loop runs since boot
-    float vel_sp, vel, uq;
+    float angle, vel_sp, vel, uq;
 } rec_row_t;
 static rec_row_t rec[REC_N];
 static volatile uint32_t rec_len; // REC_N means full and waiting to be dumped
@@ -289,7 +289,7 @@ void PendSV_Handler(void) {
     if (closed && !was_closed && rec_len == 0) rec_len = 1;
     was_closed = closed;
     if (rec_len > 0 && rec_len <= REC_N) {
-        rec[rec_len - 1] = (rec_row_t){pendsv_count, joint.vel_sp, vel, joint.uq};
+        rec[rec_len - 1] = (rec_row_t){pendsv_count, e.angle, joint.vel_sp, vel, joint.uq};
         rec_len++;
     }
 
@@ -383,11 +383,11 @@ static long milli(float x) { return isfinite(x) ? lroundf(x * 1000.0f) : 0; }
 // dump the recorder as CSV once full. blocking is fine here, but keep kicking between lines
 static void rec_dump(void) {
     if (rec_len <= REC_N) return;
-    printf("rec: t_ms,vel_sp_mrad_s,vel_mrad_s,uq_mv\r\n");
+    printf("rec: t_ms,angle_mrad,vel_sp_mrad_s,vel_mrad_s,uq_mv\r\n");
     for (uint32_t i = 0; i < REC_N; i++) {
         const rec_row_t *r = &rec[i];
-        printf("%lu,%ld,%ld,%ld\r\n", (r->n - rec[0].n) * (1000 / CFC_CTRL_HZ), milli(r->vel_sp), milli(r->vel),
-               milli(r->uq));
+        printf("%lu,%ld,%ld,%ld,%ld\r\n", (r->n - rec[0].n) * (1000 / CFC_CTRL_HZ), milli(r->angle),
+               milli(r->vel_sp), milli(r->vel), milli(r->uq));
         kick_if_tick_alive();
     }
     printf("rec: end\r\n");
@@ -419,6 +419,30 @@ static void joint_test_service(void) {
         static const float seq[] = {0.15f, 0.0f, -0.15f, 0.0f};
         joint_cmd(JCMD_TARGET, seq[step++ % 4]);
         next_ms = now + 2000;
+    } else if (JOINT_TEST == 3 && c.state == JOINT_CLOSED_PID) {
+        // up then down, so friction pulls each angle both ways and averages out in the fit.
+        // every 100 ms: 30 per hold, the last 10 (1 s, settled) are averaged
+        static float uq_sum, a_sum;
+        uint32_t k = step % 30, hold = step / 30;
+        if (hold >= 17) {
+            next_ms = UINT32_MAX;
+            joint_cmd(JCMD_DISABLE, 0);
+            printf("grav: done, disabled\r\n");
+            return;
+        }
+        if (k == 0) joint_cmd(JCMD_TARGET, -0.4f + 0.1f * (float)(hold <= 8 ? hold : 16 - hold));
+        if (k >= 20) {
+            enc_telem_t e;
+            seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
+            uq_sum += c.uq;
+            a_sum += e.angle;
+        }
+        if (k == 29) {
+            printf("grav: %ld,%ld\r\n", milli(a_sum / 10), milli(uq_sum / 10)); // angle mrad, uq mV
+            uq_sum = a_sum = 0;
+        }
+        step++;
+        next_ms = now + 100;
     } else {
         next_ms = now + 100;
     }

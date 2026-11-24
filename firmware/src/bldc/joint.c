@@ -17,7 +17,7 @@ void joint_init(joint_t *j, bool cfc_ok, bool enc_ok) {
         .angle = NAN,
         .uq_limit = CLOSEDLOOP_V,
         .pid_angle = {.kp = PID_ANGLE_P, .out_limit = VEL_LIMIT},
-        .pid_vel = {.kp = PID_VEL_P, .ki = PID_VEL_I, .i_limit = CLOSEDLOOP_V, .out_limit = CLOSEDLOOP_V,
+        .pid_vel = {.kp = PID_VEL_P, .ki = PID_VEL_I, .i_limit = PID_VEL_LIMIT, .out_limit = PID_VEL_LIMIT,
                     .ramp = PID_VEL_RAMP},
     };
 }
@@ -114,8 +114,8 @@ int joint_set_target(joint_t *j, float rad) {
 int joint_set_vlimit(joint_t *j, float volts) {
     if (!isfinite(volts)) return -EINVAL;
     j->uq_limit = fminf(fmaxf(volts, VLIMIT_MIN_V), CLOSEDLOOP_V);
-    j->pid_vel.i_limit = j->uq_limit;
-    j->pid_vel.out_limit = j->uq_limit;
+    j->pid_vel.i_limit = fminf(j->uq_limit, PID_VEL_LIMIT);
+    j->pid_vel.out_limit = j->pid_vel.i_limit;
     return 0;
 }
 

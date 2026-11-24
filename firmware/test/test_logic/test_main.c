@@ -288,6 +288,17 @@ static void test_joint_target_and_vlimit_clamp(void) {
     }
 }
 
+// the PI is clamped at PID_VEL_LIMIT like the bring-up; only the feedforward goes past it
+static void test_joint_pi_limit(void) {
+    joint_t j = joint_closed(0.0f);
+    joint_set_target(&j, TRAVEL_RAD);
+    for (int i = 0; i < 1000; i++) {
+        joint_step(&j, -TRAVEL_RAD, 0.0f);
+        TEST_ASSERT_TRUE(fabsf(j.uq - GRAV_K * sinf(-TRAVEL_RAD + GRAV_PHI)) <= PID_VEL_LIMIT + 1e-5f);
+    }
+    TEST_ASSERT_EQUAL_FLOAT(PID_VEL_LIMIT, j.pid_vel.integral);
+}
+
 static void test_joint_fault_zeroes_uq(void) {
     joint_t j = joint_closed(0.0f);
     joint_set_target(&j, 0.4f);
@@ -345,6 +356,7 @@ int main(void) {
     RUN_TEST(test_joint_enable_guards);
     RUN_TEST(test_joint_bumpless_enable);
     RUN_TEST(test_joint_target_and_vlimit_clamp);
+    RUN_TEST(test_joint_pi_limit);
     RUN_TEST(test_joint_fault_zeroes_uq);
     RUN_TEST(test_joint_cfc_fallback_bumpless);
     return UNITY_END();
