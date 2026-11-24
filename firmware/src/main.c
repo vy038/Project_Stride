@@ -1,5 +1,6 @@
 #include "bldc/foc.h"
 #include "bldc/joint.h"
+#include "bldc/vel.h"
 #include "can/can_node.h"
 #include "cfc_ctrl.h"
 #include "config.h"
@@ -8,6 +9,7 @@
 #include "drivers/pwm3.h"
 #include "drivers/uart.h"
 #include "drivers/wdg.h"
+#include "seqlock.h"
 #include <errno.h>
 #include <math.h>
 #include <stdbool.h>
@@ -46,10 +48,17 @@ static volatile uint32_t tick_count;
 static volatile uint32_t isr_min = UINT32_MAX, isr_max;
 static volatile uint32_t period_min = UINT32_MAX, period_max;
 
-// encoder, written only by the tick. raw holds the last good reading on a miss
-static volatile uint16_t enc_raw;
-static volatile bool enc_lost;
-static volatile uint32_t enc_fails, enc_lost_events, enc_start_max;
+// encoder telemetry. the tick is the only writer, lower priorities read it with seqlock_read.
+// on a miss raw/angle hold the last good reading; angle is NAN until the first one
+typedef struct {
+    float angle, vel; // rad, rad/s
+    uint32_t fails;
+    uint16_t raw;
+    bool lost;
+} enc_telem_t;
+static enc_telem_t enc_telem;
+static seqlock_t enc_lock;
+static volatile uint32_t enc_lost_events, enc_start_max;
 
 void TIM2_IRQHandler(void) {
     static uint32_t last_entry;
@@ -67,17 +76,19 @@ void TIM2_IRQHandler(void) {
     tick_count++;
 
     // encoder: collect the read started last tick, then start the next, so reads never overlap
+    static enc_telem_t e = {.angle = NAN};
     static uint32_t fail_run;
     uint16_t raw;
     int r = as5600_get(&raw);
     if (r == 0) {
-        enc_raw = raw;
+        e.raw = raw;
+        e.angle = ENC_DIR * (raw * AS5600_RAD_PER_COUNT - ENC_ZERO_RAD);
         fail_run = 0;
-        enc_lost = false;
+        e.lost = false;
     } else if (r != -EAGAIN) { // -EAGAIN: nothing was started yet, not a failure
-        enc_fails++;           // includes a read still running a tick later
+        e.fails++;             // includes a read still running a tick later
         if (fail_run < ENC_LOST_N && ++fail_run == ENC_LOST_N) {
-            enc_lost = true;
+            e.lost = true;
             enc_lost_events++;
         }
     }
@@ -88,8 +99,17 @@ void TIM2_IRQHandler(void) {
         if (c > enc_start_max) enc_start_max = c;
     }
 
+    // velocity at the outer-loop rate, its window and filter assume that dt
+    // TODO: move into PendSV with the outer loop
+    static vel_t vel;
+    static uint32_t vel_div;
+    if (++vel_div == FOC_HZ / CFC_CTRL_HZ) {
+        vel_div = 0;
+        if (isfinite(e.angle)) e.vel = vel_step(&vel, e.angle);
+    }
+    seqlock_write(&enc_lock, &enc_telem, &e, sizeof e);
+
     // TODO:
-    //   joint angle -> velocity estimate -> publish via seqlock
     //   theta_e from angle (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
     //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
 
@@ -196,6 +216,9 @@ static void kick_if_tick_alive(void) {
     }
 }
 
+// for printing floats without float printf. NAN prints as 0
+static long milli(float x) { return isfinite(x) ? lroundf(x * 1000.0f) : 0; }
+
 // everything the superloop must do every pass, including inside temporary busy-waits
 static uint32_t i2c_recoveries;
 static void superloop_service(void) {
@@ -250,9 +273,27 @@ int main(void) {
         t0 = HAL_GetTick();
         uint32_t c0 = DWT->CYCCNT;
         uint32_t n0 = tick_count;
-        while (HAL_GetTick() - t0 < 1000) {
+        // once per ms: sample raw for the noise figure. every 100 ms: print angle and velocity
+        enc_telem_t e;
+        seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
+        uint16_t raw0 = e.raw;
+        int32_t sum = 0;
+        uint64_t sumsq = 0;
+        uint32_t n = 0, last_ms = UINT32_MAX;
+        for (uint32_t ms; (ms = HAL_GetTick() - t0) < 1000;) {
             superloop_service(); // the busy-wait is part of the superloop
+            if (ms == last_ms) continue;
+            last_ms = ms;
+            seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
+            int32_t d = (int32_t)e.raw - raw0; // offset from the first sample keeps the sums small
+            sum += d;
+            sumsq += (uint64_t)((int64_t)d * d);
+            n++;
+            if (ms % 100 == 0) printf("angle %ld mrad  vel %ld mrad/s\r\n", milli(e.angle), milli(e.vel));
         }
+        // std of raw in counts, only meaningful with the shaft still
+        float mean = (float)sum / n;
+        float noise = sqrtf(fmaxf((float)sumsq / n - mean * mean, 0.0f));
         // use DWT->CYCCNT as the counter so it doesn't affect tick ISR (independent of tick timer)
         uint32_t cycles = DWT->CYCCNT - c0;
         uint32_t ticks = tick_count - n0;
@@ -260,8 +301,8 @@ int main(void) {
         // remove later: budget is 16800 cycles, period should sit within a few cycles of 16800
         printf("isr cycles: %lu-%lu  period: %lu-%lu\r\n", isr_min, isr_max, period_min, period_max);
         i2c_timing_t it = i2c_last_timing();
-        printf("enc raw %u  fails %lu  lost %d (%lu times)  recoveries %lu\r\n", enc_raw, enc_fails, enc_lost,
-               enc_lost_events, i2c_recoveries);
+        printf("enc raw %u  noise %ld mcounts (%lu samples)  fails %lu  lost %d (%lu times)  recoveries %lu\r\n",
+               e.raw, milli(noise), n, e.fails, e.lost, enc_lost_events, i2c_recoveries);
         printf("i2c read %lu cyc, isr %lu cyc, start max %lu cyc\r\n", it.xfer_cycles, it.isr_cycles, enc_start_max);
 #if OPENLOOP_TEST
         printf("open loop: %s\r\n", openloop_ticks_left ? "running" : "stopped, EN low");

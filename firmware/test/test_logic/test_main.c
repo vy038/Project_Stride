@@ -1,5 +1,6 @@
 #include "bldc/foc.h"
 #include "bldc/pid.h"
+#include "bldc/vel.h"
 #include "ring.h"
 #include "seqlock.h"
 #include <math.h>
@@ -144,6 +145,25 @@ static void test_seqlock_no_torn_reads(void) {
     TEST_ASSERT_TRUE(reads > 0);
 }
 
+// ---------- vel ----------
+// quantised sine through the estimator, compared to the true velocity delayed by the expected lag
+static void test_vel_tracks_quantised_sine(void) {
+    const float q = 6.2831853f / 4096, amp = 0.5f, w = 6.2831853f; // 1 Hz, peak 3.1 rad/s
+    const float lag = VEL_WINDOW_N * VEL_DT / 2 + VEL_TF_S;
+    vel_t v = {0};
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, vel_step(&v, 1.0f + amp * sinf(0.0f)));
+    v = (vel_t){0};
+    float worst = 0.0f;
+    for (int k = 0; k < 2 * CFC_CTRL_HZ; k++) {
+        float t = k * VEL_DT;
+        float est = vel_step(&v, roundf((1.0f + amp * sinf(w * t)) / q) * q);
+        if (t < 0.1f) continue; // settling
+        float err = fabsf(est - amp * w * cosf(w * (t - lag)));
+        if (err > worst) worst = err;
+    }
+    TEST_ASSERT_TRUE(worst < 0.15f); // one window quantum
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_pid_step);
@@ -155,5 +175,6 @@ int main(void) {
     RUN_TEST(test_ring_wraparound);
     RUN_TEST(test_seqlock_roundtrip);
     RUN_TEST(test_seqlock_no_torn_reads);
+    RUN_TEST(test_vel_tracks_quantised_sine);
     return UNITY_END();
 }

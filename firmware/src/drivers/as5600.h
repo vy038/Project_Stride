@@ -19,6 +19,7 @@
 #define AS5600_STATUS_MH 0x08 // magnet too strong (AGC at minimum gain)
 #define AS5600_AGC_MAX   128  // AGC range at 3.3 V supply (0..255 at 5 V)
 #define AS5600_POWERUP_MS 10  // datasheet power-up time before the first read
+#define AS5600_RAD_PER_COUNT (6.2831853f / 4096)
 
 /**
  * @brief Boot check, blocking, main only. Waits out the power-up time first.

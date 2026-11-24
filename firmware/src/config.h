@@ -44,6 +44,12 @@ _Static_assert(TICK_CNT_HZ % FOC_HZ == 0, "tick period must be a whole number of
 
 _Static_assert(ENC_LOST_MS * FOC_HZ % 1000 == 0, "ENC_LOST_MS must be a whole number of ticks");
 
+// velocity estimate, runs at CFC_CTRL_HZ. lag ~ N*dt/2 + Tf = 5 + 5 ms, quantum 1.534 mrad / 10 ms
+// = 0.15 rad/s. starting point, check against the velocity loop crossover (GUIDE.md). retrain if changed
+#define VEL_WINDOW_N 5
+#define VEL_TF_S     0.005f
+#define VEL_DT       (1.0f / CFC_CTRL_HZ)
+
 // ---------- safety ----------
 #define WDG_TIMEOUT_MS  150
 #define HOST_TIMEOUT_MS 500
