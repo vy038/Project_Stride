@@ -6,6 +6,9 @@
 #define CLOSEDLOOP_V 3.0f
 #define VLIMIT_MIN_V 0.5f
 #define ALIGN_V      2.0f
+#define CALIB_SETTLE_MS 700   // per hold, same as SimpleFOC's alignSensor
+#define CALIB_MOVE_MS   250
+#define CALIB_STEP_E    1.5707963f // nudge, electrical rad: 13 deg of shaft at 7 pole pairs
 #define PWM_HZ       25000
 
 // ---------- loop rates ----------
@@ -73,7 +76,7 @@ _Static_assert(ENC_LOST_MS * FOC_HZ % 1000 == 0, "ENC_LOST_MS must be a whole nu
 
 // ---------- this node: knee ----------
 #define CAN_NODE     CAN_NODE_KNEE
-#define ENC_ZERO_RAD 2.499f
+#define ENC_ZERO_RAD 5.470f // raw angle at the zero pose. bring-up re-measured this after the encoder swap
 #define ENC_DIR      (-1.0f)
 
 #define PWM_TIM    TIM3

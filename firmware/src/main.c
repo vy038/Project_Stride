@@ -1,3 +1,4 @@
+#include "bldc/calib.h"
 #include "bldc/foc.h"
 #include "bldc/joint.h"
 #include "bldc/vel.h"
@@ -35,7 +36,19 @@
 #endif
 #define OPENLOOP_MAX_TICKS (10 * FOC_HZ) // stops itself after 10 s: it heats the motor even stalled
 
-static volatile uint32_t openloop_ticks_left; // set by main, counted down by the tick
+// temporary commutation test: build with -DCOMMUTATE_TEST=1. motor free, off the leg.
+// calibrates, then holds COMMUTATE_UQ with the field placed from the encoder. 10 s total, then EN low
+#ifndef COMMUTATE_TEST
+#define COMMUTATE_TEST 0
+#endif
+#ifndef COMMUTATE_UQ
+#define COMMUTATE_UQ 0.5f // volts, + spins one way, - the other. clamped to CLOSEDLOOP_V
+#endif
+_Static_assert(!(OPENLOOP_TEST && COMMUTATE_TEST), "one motor test at a time");
+
+static volatile uint32_t openloop_ticks_left, commutate_ticks_left; // set by main, counted down by the tick
+static volatile int commutate_state = CALIB_RUNNING; // CALIB_DONE once spinning, < 0 calibration failed
+static volatile float cal_dir, cal_zero;
 
 static joint_t joint;
 static cfc_check_t cfc_check;
@@ -82,7 +95,8 @@ void TIM2_IRQHandler(void) {
     int r = as5600_get(&raw);
     if (r == 0) {
         e.raw = raw;
-        e.angle = ENC_DIR * (raw * AS5600_RAD_PER_COUNT - ENC_ZERO_RAD);
+        // wrap to +-pi around the zero, so the 0/2pi jump of raw can't land inside the travel
+        e.angle = ENC_DIR * remainderf(raw * AS5600_RAD_PER_COUNT - ENC_ZERO_RAD, 6.2831853f);
         fail_run = 0;
         e.lost = false;
     } else if (r != -EAGAIN) { // -EAGAIN: nothing was started yet, not a failure
@@ -102,15 +116,46 @@ void TIM2_IRQHandler(void) {
     // velocity at the outer-loop rate, its window and filter assume that dt
     // TODO: move into PendSV with the outer loop
     static vel_t vel;
-    static uint32_t vel_div;
-    if (++vel_div == FOC_HZ / CFC_CTRL_HZ) {
-        vel_div = 0;
-        if (isfinite(e.angle)) e.vel = vel_step(&vel, e.angle);
-    }
+    static uint32_t ctrl_div;
+    bool ctrl_tick = ++ctrl_div == FOC_HZ / CFC_CTRL_HZ;
+    if (ctrl_tick) ctrl_div = 0;
+    if (ctrl_tick && isfinite(e.angle)) e.vel = vel_step(&vel, e.angle);
     seqlock_write(&enc_lock, &enc_telem, &e, sizeof e);
 
+#if COMMUTATE_TEST
+    if (commutate_ticks_left > 0) {
+        static calib_t cal; // zeroed is the same as calib_start
+        static float uq, theta_e;
+        int stop = e.lost || !isfinite(e.angle) ? -EIO : 0;
+        if (!stop && commutate_state == CALIB_RUNNING) {
+            if (ctrl_tick) { // calibration is written for the outer-loop rate
+                int r = calib_step(&cal, e.angle, &uq, &theta_e);
+                if (r == CALIB_DONE) {
+                    cal_dir = cal.dir;
+                    cal_zero = cal.zero_elec;
+                    commutate_state = CALIB_DONE;
+                }
+                if (r < 0) stop = r;
+            }
+        } else if (!stop) {
+            uq = fminf(fmaxf(COMMUTATE_UQ, -CLOSEDLOOP_V), CLOSEDLOOP_V);
+            theta_e = calib_theta_e(&cal, e.angle);
+        }
+        float duty[3];
+        foc_svpwm(uq, theta_e, SUPPLY_V, duty);
+        pwm3_set(duty);
+        if (stop) {
+            commutate_state = stop;
+            commutate_ticks_left = 0;
+            pwm3_enable(false);
+        } else if (--commutate_ticks_left == 0) {
+            pwm3_enable(false);
+        }
+    }
+#endif
+
     // TODO:
-    //   theta_e from angle (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
+    //   calib_theta_e(angle) (or joint.theta_e while calibrating) -> foc_svpwm(uq, theta_e, SUPPLY_V) -> pwm3_set
     //   every FOC_HZ / CFC_CTRL_HZ ticks: pend PendSV
 
     // open loop: rotate the field ourselves, the rotor gets dragged along
@@ -265,6 +310,11 @@ int main(void) {
     openloop_ticks_left = OPENLOOP_MAX_TICKS; // the tick sets duties from here on
     pwm3_enable(true);                        // breaker on last
 #endif
+#if COMMUTATE_TEST
+    printf("commutate: calibrating, then %d mV for the rest of 10 s. hands off\r\n", (int)(COMMUTATE_UQ * 1000));
+    commutate_ticks_left = 10 * FOC_HZ;
+    pwm3_enable(true);
+#endif
 
     for (;;) {
         // remove later: CYCCNT delta over 1000 SysTick ms should be 84,000,000
@@ -306,6 +356,17 @@ int main(void) {
         printf("i2c read %lu cyc, isr %lu cyc, start max %lu cyc\r\n", it.xfer_cycles, it.isr_cycles, enc_start_max);
 #if OPENLOOP_TEST
         printf("open loop: %s\r\n", openloop_ticks_left ? "running" : "stopped, EN low");
+#endif
+#if COMMUTATE_TEST
+        if (commutate_state < 0) {
+            printf("commutate: calibration FAILED (err %d), EN low\r\n", commutate_state);
+        } else if (commutate_state == CALIB_DONE) {
+            // simplefoc's zero_electric_angle for the same rotor, to compare with the bring-up's print
+            float sfoc = fmodf(cal_zero + cal_dir * ENC_DIR * POLE_PAIRS * ENC_ZERO_RAD, 6.2831853f);
+            if (sfoc < 0) sfoc += 6.2831853f;
+            printf("commutate: dir %+d  zero_elec %ld mrad (simplefoc %ld)  %s\r\n", (int)cal_dir, milli(cal_zero),
+                   milli(sfoc), commutate_ticks_left ? "spinning" : "stopped, EN low");
+        }
 #endif
 
         // watchdog test

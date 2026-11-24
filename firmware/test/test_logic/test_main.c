@@ -1,8 +1,10 @@
+#include "bldc/calib.h"
 #include "bldc/foc.h"
 #include "bldc/pid.h"
 #include "bldc/vel.h"
 #include "ring.h"
 #include "seqlock.h"
+#include <errno.h>
 #include <math.h>
 #include <threads.h>
 #include <unity.h>
@@ -164,6 +166,66 @@ static void test_vel_tracks_quantised_sine(void) {
     TEST_ASSERT_TRUE(worst < 0.15f); // one window quantum
 }
 
+// ---------- calib ----------
+// fake motor: rotor electrical angle is pp*m + off, the encoder reports joint angle s*m + c in 12-bit steps.
+// the field comes back out of the real foc_svpwm duties, so a sign slip in either module shows up
+typedef struct { float m, w, off, s, c, stuck; } plant_t;
+
+static float plant_angle(const plant_t *p) {
+    const float q = 6.2831853f / 4096;
+    return roundf((p->s * p->m + p->c) / q) * q;
+}
+
+static void plant_run(plant_t *p, float uq, float theta_e, int ticks) { // ticks of 200 us
+    float d[3];
+    foc_svpwm(uq, theta_e, SUPPLY_V, d);
+    float alpha = SUPPLY_V * (2 * d[0] - d[1] - d[2]) / 3, beta = SUPPLY_V * (d[1] - d[2]) / 1.7320508f;
+    for (int k = 0; k < ticks; k++) {
+        float pe = POLE_PAIRS * p->m + p->off;
+        float torque = beta * cosf(pe) - alpha * sinf(pe); // q-axis part of the field
+        p->w += (40.0f * torque - 20.0f * p->w) * 0.0002f;
+        p->m += p->w * 0.0002f * (1.0f - p->stuck);
+    }
+}
+
+static int run_calib(plant_t *p, calib_t *c) {
+    calib_start(c);
+    for (int i = 0; i < 10 * CFC_CTRL_HZ; i++) {
+        float uq, th;
+        int r = calib_step(c, plant_angle(p), &uq, &th);
+        if (r != CALIB_RUNNING) return r;
+        plant_run(p, uq, th, FOC_HZ / CFC_CTRL_HZ);
+    }
+    return -ETIMEDOUT;
+}
+
+static void test_calib_fake_plant(void) {
+    const float offs[] = {0.3f, 2.0f, 4.5f}, cs[] = {-2.0f, 0.0f, 1.0f};
+    for (int si = 0; si < 2; si++)
+        for (int oi = 0; oi < 3; oi++)
+            for (int ci = 0; ci < 3; ci++) {
+                plant_t p = {.m = 0.1f * oi, .off = offs[oi], .s = si ? -1.0f : 1.0f, .c = cs[ci]};
+                calib_t c;
+                TEST_ASSERT_EQUAL_INT(CALIB_DONE, run_calib(&p, &c));
+                TEST_ASSERT_EQUAL_FLOAT(p.s, c.dir);
+                float want = POLE_PAIRS * p.s * p.c - p.off; // rotor electrical angle is 0 there
+                float e = remainderf(c.zero_elec - want, 6.2831853f);
+                TEST_ASSERT_FLOAT_WITHIN(0.1f, 0.0f, e);
+                // commutate: +uq must raise the joint angle, -uq lower it, whatever the wiring
+                for (float uq = -1.0f; uq <= 1.0f; uq += 2.0f) {
+                    float a0 = plant_angle(&p);
+                    for (int t = 0; t < FOC_HZ / 2; t++) plant_run(&p, uq, calib_theta_e(&c, plant_angle(&p)), 1);
+                    TEST_ASSERT_TRUE(uq * (plant_angle(&p) - a0) > 0.5f);
+                }
+            }
+}
+
+static void test_calib_stuck_rotor_fails(void) {
+    plant_t p = {.off = 1.0f, .s = 1.0f, .stuck = 1.0f};
+    calib_t c;
+    TEST_ASSERT_EQUAL_INT(-EIO, run_calib(&p, &c));
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_pid_step);
@@ -176,5 +238,7 @@ int main(void) {
     RUN_TEST(test_seqlock_roundtrip);
     RUN_TEST(test_seqlock_no_torn_reads);
     RUN_TEST(test_vel_tracks_quantised_sine);
+    RUN_TEST(test_calib_fake_plant);
+    RUN_TEST(test_calib_stuck_rotor_fails);
     return UNITY_END();
 }
