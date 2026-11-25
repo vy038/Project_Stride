@@ -71,7 +71,7 @@ _Static_assert(ENC_LOST_MS * FOC_HZ % 1000 == 0, "ENC_LOST_MS must be a whole nu
 
 // ---------- CAN, MCP2515 on SPI2 ----------
 #define MCP2515_XTAL_HZ 8000000
-#define SPI_HZ          4000000
+#define SPI_HZ          2625000 // 42 MHz / 16. the bring-up asked for 4 MHz and STM32duino rounded down to this
 #define STATUS_MS       100
 #define FEEDBACK_MS     20
 

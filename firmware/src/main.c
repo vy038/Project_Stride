@@ -8,7 +8,9 @@
 #include "config.h"
 #include "drivers/as5600.h"
 #include "drivers/i2c.h"
+#include "drivers/mcp2515.h"
 #include "drivers/pwm3.h"
+#include "drivers/spi.h"
 #include "drivers/uart.h"
 #include "drivers/wdg.h"
 #include "ring.h"
@@ -18,6 +20,7 @@
 #include <stdbool.h>
 #include "stm32f4xx_hal.h"
 #include <stdio.h>
+#include <string.h>
 
 // temporary test
 #ifndef WDG_TEST
@@ -54,6 +57,14 @@ _Static_assert(!(OPENLOOP_TEST && COMMUTATE_TEST), "one motor test at a time");
 #define JOINT_TEST 0
 #endif
 _Static_assert(!(JOINT_TEST && (OPENLOOP_TEST || COMMUTATE_TEST)), "one motor test at a time");
+
+// temporary CAN bench tests, build with -DCAN_TEST=1, 2 or 3:
+//   1: SPI only. wire MISO (PB14) to MOSI (PB15), MCP2515 unplugged. sends 0..255, checks the echo
+//   2: MCP2515 loopback mode, no bus needed. a frame a second comes back through the RX path and is compared
+//   3: real bus, normal mode. a frame every 100 ms (id node<<5 | 0x1F, 4-byte counter), prints what arrives
+#ifndef CAN_TEST
+#define CAN_TEST 0
+#endif
 
 // temporary: busy-wait this long in every PendSV, standing in for the ~168 us CfC step
 #ifndef PENDSV_LOAD_US
@@ -449,12 +460,49 @@ static void joint_test_service(void) {
 }
 #endif
 
+#if CAN_TEST >= 2
+static uint32_t can_test_sent;
+static can_frame_t can_test_frame;
+#if CAN_TEST == 2
+static uint32_t can_test_ok, can_test_bad;
+#endif
+
+static void can_test_service(void) {
+    static uint32_t next_ms;
+    uint32_t now = HAL_GetTick();
+    if (now < next_ms) return;
+    next_ms = now + (CAN_TEST == 2 ? 1000 : 100);
+#if CAN_TEST == 2
+    // last second's frame should be back by now. compare every field: a wrong ID shift still
+    // gets the data right
+    if (can_test_sent) {
+        can_node_stats_t c = can_node_stats();
+        bool same = c.last.id == can_test_frame.id && c.last.dlc == can_test_frame.dlc &&
+                    memcmp(c.last.data, can_test_frame.data, can_test_frame.dlc) == 0;
+        if (same) can_test_ok++;
+        else can_test_bad++;
+    }
+    // 0x5A5 alternates bits across the SIDH/SIDL split; the DLC walks 0..8
+    can_test_frame = (can_frame_t){.id = 0x5A5, .dlc = (uint8_t)(can_test_sent % 9)};
+    for (int i = 0; i < 8; i++) can_test_frame.data[i] = (uint8_t)(can_test_sent + 17 * i);
+#else
+    can_test_frame = (can_frame_t){.id = can_make_id(CAN_NODE, 0x1F), .dlc = 4};
+    memcpy(can_test_frame.data, &can_test_sent, 4);
+#endif
+    if (can_node_send(&can_test_frame) == 0) can_test_sent++;
+}
+#endif
+
 // everything the superloop must do every pass, including inside temporary busy-waits
 static uint32_t i2c_recoveries;
 static void superloop_service(void) {
     kick_if_tick_alive();
     if (i2c_recover() == 1) i2c_recoveries++;
     rec_dump();
+    can_node_poll(HAL_GetTick());
+#if CAN_TEST >= 2
+    can_test_service();
+#endif
 #if JOINT_TEST
     joint_test_service();
 #endif
@@ -479,7 +527,6 @@ int main(void) {
     if (enc_check == 0) enc_check = as5600_check(&agc);
     printf("as5600: %s (err %d), agc %u of %u\r\n", enc_check == 0 ? "ok" : "FAILED, never enable", enc_check, agc,
            AS5600_AGC_MAX);
-    // TODO: spi_init + mcp2515_init
     // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
     bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
     printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
@@ -487,9 +534,23 @@ int main(void) {
     cfc_check = cfc_ctrl_check();
     joint_init(&joint, cfc_check.ok, enc_check == 0);
     ring_init(&cmd_ring, cmd_buf, 8, sizeof cmd_buf[0]);
-    can_node_init();
+#if CAN_TEST == 1
+    {
+        spi_init();
+        uint8_t tx[256], rx[256];
+        for (int i = 0; i < 256; i++) tx[i] = (uint8_t)i;
+        spi_cs(true);
+        int r = spi_xfer(tx, rx, sizeof tx);
+        spi_cs(false);
+        int bad = 0;
+        for (int i = 0; i < 256; i++) bad += rx[i] != tx[i];
+        printf("spi loopback: err %d, %d of 256 bytes wrong\r\n", r, bad);
+    }
+#endif
+    int can_err = can_node_init(CAN_TEST == 2 ? MCP2515_MODE_LOOPBACK : MCP2515_MODE_NORMAL);
+    printf("can: %s (err %d), INT %s\r\n", can_err == 0 ? "ok" : "FAILED", can_err,
+           can_node_stats().int_active ? "on" : "off, polling");
 
-    // TODO: EXTI9_5 (MCP2515 INT) 3
     NVIC_SetPriority(PendSV_IRQn, 2); // below the tick (0) and I2C (1)
     tick_start();
 
@@ -553,6 +614,20 @@ int main(void) {
         printf("enc raw %u  noise %ld mcounts (%lu samples)  fails %lu  lost %d (%lu times)  recoveries %lu\r\n",
                e.raw, milli(noise), n, e.fails, e.lost, enc_lost_events, i2c_recoveries);
         printf("i2c read %lu cyc, isr %lu cyc, start max %lu cyc\r\n", it.xfer_cycles, it.isr_cycles, enc_start_max);
+#if CAN_TEST >= 2
+        {
+            can_node_stats_t c = can_node_stats();
+            printf("can: sent %lu", can_test_sent);
+#if CAN_TEST == 2
+            printf("  ok %lu  bad %lu", can_test_ok, can_test_bad);
+#endif
+            printf("  rx %lu  dropped %lu  hw_ovf %lu  tx_fail %lu  tec %u rec %u eflg 0x%02x\r\n", c.rx,
+                   c.rx_dropped, c.hw_overflow, c.tx_fail, c.tec, c.rec, c.eflg);
+            printf("can: last id 0x%03x dlc %u:", c.last.id, c.last.dlc);
+            for (int i = 0; i < c.last.dlc; i++) printf(" %02x", c.last.data[i]);
+            printf("\r\n");
+        }
+#endif
 #if OPENLOOP_TEST
         printf("open loop: %s\r\n", openloop_ticks_left ? "running" : "stopped, EN low");
 #endif
@@ -582,8 +657,6 @@ int main(void) {
             kick_if_tick_alive();
         }
 #endif
-        // TODO: can_node_poll
-
         superloop_service();
     }
 }
