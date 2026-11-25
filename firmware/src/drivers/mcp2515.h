@@ -7,7 +7,7 @@
  * @file mcp2515.h
  * @brief MCP2515 CAN controller over SPI2. Superloop and boot only, like spi.h.
  *
- * 8 MHz crystal, 500 kbit/s, standard 11-bit frames. Sends through TXB0 only; receives into
+ * 8 MHz crystal, 500 kbit/s, standard 11-bit frames. Sends through whichever of TXB0..2 is free; receives into
  * RXB0, rolling over into RXB1 when RXB0 is full. Register map and bit timing: MCP2515 datasheet,
  * values cross-checked against the autowp library the bring-up ran on.
  */
@@ -35,8 +35,8 @@ int mcp2515_int_init(void);
 bool mcp2515_int_low(void);
 
 /**
- * @brief Queue one frame in TXB0 and request sending. Doesn't wait for it to go out.
- * @return 0, -EBUSY TXB0 still sending the last one (nobody ACKing keeps it busy forever),
+ * @brief Queue one frame in a free TX buffer and request sending. Doesn't wait for it to go out.
+ * @return 0, -EBUSY all 3 still pending (nobody ACKing keeps them busy forever),
  *         -EINVAL dlc > 8 or id > 11 bits, -ETIMEDOUT SPI
  */
 int mcp2515_send(const can_frame_t *f);

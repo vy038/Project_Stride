@@ -119,6 +119,17 @@ int joint_set_vlimit(joint_t *j, float volts) {
     return 0;
 }
 
+int joint_apply(joint_t *j, const joint_cmd_t *c) {
+    switch (c->op) {
+    case JCMD_ENABLE: return joint_enable(j);
+    case JCMD_DISABLE: joint_disable(j); return 0;
+    case JCMD_TARGET: return joint_set_target(j, c->arg);
+    case JCMD_VLIMIT: return joint_set_vlimit(j, c->arg);
+    case JCMD_CFC: return joint_set_cfc(j, c->arg != 0.0f);
+    }
+    return -EINVAL;
+}
+
 int joint_set_cfc(joint_t *j, bool on) {
     if (!on) {
         if (j->state == JOINT_CLOSED_CFC) enter_pid(j);

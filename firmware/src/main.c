@@ -78,11 +78,6 @@ static volatile float cal_dir, cal_zero;
 // PendSV owns the joint once the tick runs. everyone else sends it commands through cmd_ring
 // (superloop pushes, PendSV pops, lock-free single producer/consumer) and reads ctrl_telem
 static joint_t joint;
-typedef enum { JCMD_ENABLE, JCMD_DISABLE, JCMD_TARGET, JCMD_VLIMIT, JCMD_CFC } jcmd_op_t;
-typedef struct {
-    jcmd_op_t op;
-    float arg;
-} joint_cmd_t;
 static joint_cmd_t cmd_buf[8];
 static ring_t cmd_ring;
 static cfc_check_t cfc_check;
@@ -266,15 +261,7 @@ void PendSV_Handler(void) {
 
     static int8_t cmd_err;
     joint_cmd_t cmd;
-    while (ring_pop(&cmd_ring, &cmd)) {
-        switch (cmd.op) {
-        case JCMD_ENABLE: cmd_err = (int8_t)joint_enable(&joint); break;
-        case JCMD_DISABLE: joint_disable(&joint); cmd_err = 0; break;
-        case JCMD_TARGET: cmd_err = (int8_t)joint_set_target(&joint, cmd.arg); break;
-        case JCMD_VLIMIT: cmd_err = (int8_t)joint_set_vlimit(&joint, cmd.arg); break;
-        case JCMD_CFC: cmd_err = (int8_t)joint_set_cfc(&joint, cmd.arg != 0.0f); break;
-        }
-    }
+    while (ring_pop(&cmd_ring, &cmd)) cmd_err = (int8_t)joint_apply(&joint, &cmd);
 
     enc_telem_t e;
     seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
@@ -406,7 +393,8 @@ static void rec_dump(void) {
 }
 
 // returns false if the ring is full (PendSV not running)
-static inline bool joint_cmd(jcmd_op_t op, float arg) { return ring_push(&cmd_ring, &(joint_cmd_t){op, arg}); }
+static bool joint_push(const joint_cmd_t *c) { return ring_push(&cmd_ring, c); }
+static inline bool joint_cmd(joint_cmd_op_t op, float arg) { return joint_push(&(joint_cmd_t){op, arg}); }
 
 #if JOINT_TEST
 static void joint_test_service(void) {
@@ -499,7 +487,13 @@ static void superloop_service(void) {
     kick_if_tick_alive();
     if (i2c_recover() == 1) i2c_recoveries++;
     rec_dump();
-    can_node_poll(HAL_GetTick());
+    enc_telem_t e;
+    ctrl_telem_t c;
+    seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
+    seqlock_read(&ctrl_lock, &c, &ctrl_telem, sizeof c);
+    can_node_telem_t t = {.angle = e.angle, .vel = c.vel, .state = (joint_state_t)c.state,
+                          .joint_faults = c.faults, .cmd_err = c.cmd_err, .i2c_err = e.fails};
+    can_node_poll(HAL_GetTick(), &t, joint_push);
 #if CAN_TEST >= 2
     can_test_service();
 #endif
@@ -527,7 +521,6 @@ int main(void) {
     if (enc_check == 0) enc_check = as5600_check(&agc);
     printf("as5600: %s (err %d), agc %u of %u\r\n", enc_check == 0 ? "ok" : "FAILED, never enable", enc_check, agc,
            AS5600_AGC_MAX);
-    // TODO: report FAULT_DEADMAN to the host over CAN once joint faults exist
     bool deadman = wdg_caused_reset(); // must be read before anything else clears RCC->CSR
     printf("reset cause: %s\r\n", deadman ? "IWDG (watchdog)" : "other");
 
@@ -547,7 +540,8 @@ int main(void) {
         printf("spi loopback: err %d, %d of 256 bytes wrong\r\n", r, bad);
     }
 #endif
-    int can_err = can_node_init(CAN_TEST == 2 ? MCP2515_MODE_LOOPBACK : MCP2515_MODE_NORMAL);
+    int can_err = can_node_init(CAN_TEST == 2 ? MCP2515_MODE_LOOPBACK : MCP2515_MODE_NORMAL,
+                                deadman ? FAULT_DEADMAN : 0); // STATUS reports it until the next ENABLE
     printf("can: %s (err %d), INT %s\r\n", can_err == 0 ? "ok" : "FAILED", can_err,
            can_node_stats().int_active ? "on" : "off, polling");
 

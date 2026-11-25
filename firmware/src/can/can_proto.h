@@ -1,26 +1,31 @@
-// Stride CAN protocol v0. The single source of truth for frame layout; pc/can_host.py mirrors it.
-// C port of the bring-up's stride_can.h, plus FAULT_ESTOP.
+// Stride CAN protocol v1. The single source of truth for frame layout; pc/can_host.py mirrors it.
+// Readable version with examples: V1_NOTES.md section 5. Change this file and can_host.py together.
 //
-// Bus: classic CAN 2.0A, 11-bit IDs, 500 kbit/s.
+// Bus: classic CAN 2.0A, 11-bit IDs, 500 kbit/s. Data frames only (extended/remote ignored).
 // ID  = (node_id << 5) | cmd        node_id 1..63, cmd 0..31  (same scheme as ODrive CANSimple)
 // ID 0x000 = E-STOP, all nodes. Lowest ID wins arbitration, so it beats everything else on the bus.
 // Multi-byte fields are little-endian. Floats are IEEE-754 float32.
 //
 // Host -> leg
 //   cmd  name          DLC  payload
-//   0x00 HEARTBEAT     0    -                      keeps a CAN-enabled leg alive (any frame does)
-//   0x01 DISABLE       0    -                      driver off
-//   0x02 ENABLE        0    -                      calibrate if needed, then closed-loop hold
-//   0x03 SET_TARGET    4    f32 angle [rad]        closed-loop position target
-//   0x04 SET_VLIMIT    4    f32 volts              clamped to 0.5..6 V (the node clamps to CLOSEDLOOP_V)
+//   0x00 HEARTBEAT     any  -                      keeps a CAN-enabled leg alive (any frame for it does)
+//   0x01 DISABLE       any  -                      driver off
+//   0x02 ENABLE        any  -                      clear faults, calibrate if needed, then hold where it is
+//   0x03 SET_TARGET    4    f32 angle [rad]        clamped to +-TRAVEL_RAD
+//   0x04 SET_VLIMIT    4    f32 volts              clamped to VLIMIT_MIN_V..CLOSEDLOOP_V (0.5..3 V)
+//   SET_* with DLC != 4 or a non-finite float, or an unknown cmd: ignored, FAULT_BAD_FRAME set.
 //
 // Leg -> host
-//   0x10 STATUS        8    u8 state, u8 faults, u8 last_cmd, u8 rx_count,
+//   0x10 STATUS        8    u8 state, u8 faults, u8 last_cmd, i8 last_err,
 //                           u16 i2c_err, u16 ms_since_host            (10 Hz)
-//   0x11 FEEDBACK      8    f32 angle [rad], f32 velocity [rad/s]     (50 Hz)
+//   0x11 FEEDBACK      8    f32 angle [rad], f32 velocity [rad/s]     (50 Hz; NaN angle = no reading yet)
 //
 // Safety: if the leg was enabled over CAN and hears no frame from the host for
 // HOST_TIMEOUT_MS (config.h), it disables itself and sets FAULT_HOST_TIMEOUT.
+// E-STOP disables and sets FAULT_ESTOP; only an explicit ENABLE runs the leg again.
+//
+// v0 -> v1: STATUS byte 3 was rx_count, now the last command's result (0 or -errno: -34 outside
+// travel, -19 encoder failed its boot check). States 4..6 and FAULT_ESTOP added.
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -40,7 +45,16 @@ enum {
     MSG_FEEDBACK = 0x11,
 };
 
-enum { STATE_IDLE = 0, STATE_OPEN_LOOP = 1, STATE_CLOSED_LOOP = 2, STATE_ENCODER = 3 };
+// 1 and 3 were bring-up modes, kept so the numbers mean the same thing in old logs
+enum {
+    STATE_IDLE = 0,
+    STATE_OPEN_LOOP = 1,
+    STATE_CLOSED_LOOP = 2, // PID
+    STATE_ENCODER = 3,
+    STATE_CALIBRATING = 4,
+    STATE_CLOSED_CFC = 5,
+    STATE_FAULT = 6,
+};
 
 enum {
     FAULT_ENCODER_LOST = 1 << 0,

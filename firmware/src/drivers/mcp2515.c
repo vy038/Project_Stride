@@ -15,9 +15,8 @@
 #define INS_READ      0x03
 #define INS_WRITE     0x02
 #define INS_BITMOD    0x05
-#define INS_STATUS    0xA0 // b0 RX0IF, b1 RX1IF, b2 TXB0 TXREQ
-#define INS_LOAD_TX0  0x40 // write from TXB0SIDH
-#define INS_RTS_TX0   0x81
+#define INS_STATUS    0xA0 // b0 RX0IF, b1 RX1IF, b2/b4/b6 TXB0/1/2 TXREQ
+#define INS_LOAD_TX0  0x40 // write from TXB0SIDH; TXB1 0x42, TXB2 0x44
 #define INS_READ_RX0  0x90 // read from RXB0SIDH, clears RX0IF when CS goes high
 #define INS_READ_RX1  0x94
 
@@ -131,13 +130,16 @@ int mcp2515_send(const can_frame_t *f) {
     const uint8_t q[2] = {INS_STATUS};
     int r = cmd(q, st, 2);
     if (r) return r;
-    if (st[1] & 0x04) return -EBUSY;
+    int b = 0; // first free TX buffer: STATUS and FEEDBACK can be due in the same pass
+    while (b < 3 && (st[1] & (0x04 << (2 * b)))) b++;
+    if (b == 3) return -EBUSY;
 
     // SIDH, SIDL, EID8, EID0, DLC, data
-    uint8_t tx[1 + 5 + 8] = {INS_LOAD_TX0, (uint8_t)(f->id >> 3), (uint8_t)((f->id & 7) << 5), 0, 0, f->dlc};
+    uint8_t tx[1 + 5 + 8] = {(uint8_t)(INS_LOAD_TX0 + 2 * b), (uint8_t)(f->id >> 3), (uint8_t)((f->id & 7) << 5), 0,
+                             0, f->dlc};
     memcpy(tx + 6, f->data, f->dlc);
     if ((r = cmd(tx, NULL, 6 + f->dlc))) return r;
-    const uint8_t rts = INS_RTS_TX0;
+    const uint8_t rts = (uint8_t)(0x80 | (1u << b)); // 0x81, 0x82, 0x84
     return cmd(&rts, NULL, 1);
 }
 

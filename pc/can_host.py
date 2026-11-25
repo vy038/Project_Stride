@@ -1,6 +1,6 @@
 """Stride CAN host: talk to the leg through the CANable.
 
-Mirrors src/stride_can.h. Sends a heartbeat at 10 Hz, decodes STATUS/FEEDBACK, takes commands on stdin.
+Mirrors firmware/src/can/can_proto.h (protocol v1). Change both together. Sends a heartbeat at 10 Hz, decodes STATUS/FEEDBACK, takes commands on stdin.
 
 Setup (pip install python-can):
   candleLight firmware on Linux -> native SocketCAN:
@@ -21,17 +21,20 @@ NODES = {"knee": 1, "hip": 2}
 ID_ESTOP = 0x000
 CMD = dict(heartbeat=0x00, disable=0x01, enable=0x02, set_target=0x03, set_vlimit=0x04)
 MSG_STATUS, MSG_FEEDBACK = 0x10, 0x11
-STATES = {0: "IDLE", 1: "OPEN_LOOP", 2: "CLOSED_LOOP", 3: "ENCODER"}
-FAULTS = ["ENCODER_LOST", "DEADMAN", "HOST_TIMEOUT", "CALIB_FAILED", "BAD_FRAME"]
+STATES = {0: "IDLE", 1: "OPEN_LOOP", 2: "CLOSED_PID", 3: "ENCODER", 4: "CALIBRATING", 5: "CLOSED_CFC", 6: "FAULT"}
+FAULTS = ["ENCODER_LOST", "DEADMAN", "HOST_TIMEOUT", "CALIB_FAILED", "BAD_FRAME", "ESTOP"]
+ERRS = {0: "ok", -34: "ERANGE (outside travel / no angle)", -19: "ENODEV (encoder failed boot check)", -22: "EINVAL"}
 
 def make_id(node, cmd): return (node << 5) | (cmd & 0x1F)
 
 def decode_status(d):
-    state, faults, last_cmd, rx = d[0], d[1], d[2], d[3]
+    state, faults, last_cmd = d[0], d[1], d[2]
+    last_err = struct.unpack_from("<b", d, 3)[0]
     i2c_err, age = struct.unpack_from("<HH", d, 4)
     names = [n for i, n in enumerate(FAULTS) if faults & (1 << i)] or ["none"]
+    age_s = "never" if age == 0xFFFF else f"{age}ms"
     return (f"STATUS {STATES.get(state, state)}  faults={','.join(names)}  "
-            f"last_cmd=0x{last_cmd:02X}  rx={rx}  i2c_err={i2c_err}  host_age={age}ms")
+            f"last_cmd=0x{last_cmd:02X} -> {ERRS.get(last_err, last_err)}  i2c_err={i2c_err}  host_age={age_s}")
 
 def decode_feedback(d):
     angle, vel = struct.unpack("<ff", bytes(d[:8]))

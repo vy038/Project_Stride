@@ -1,6 +1,7 @@
 #include "bldc/calib.h"
 #include "bldc/foc.h"
 #include "bldc/joint.h"
+#include "can/can_dispatch.h"
 #include "can/can_proto.h"
 #include "bldc/pid.h"
 #include "bldc/vel.h"
@@ -339,6 +340,73 @@ static void test_joint_cfc_fallback_bumpless(void) {
     TEST_ASSERT_EQUAL_INT(-ENOTSUP, joint_set_cfc(&k, true)); // golden check failed
 }
 
+// ---------- can dispatch ----------
+static can_frame_t frame(uint16_t id, uint8_t dlc, float v) {
+    can_frame_t f = {.id = id, .dlc = dlc};
+    can_put_f32(f.data, v);
+    return f;
+}
+
+static void test_can_dispatch_commands(void) {
+    const uint8_t me = 1;
+    can_frame_t f = frame(can_make_id(me, CMD_SET_TARGET), 4, 0.1f);
+    can_action_t a = can_dispatch(&f, me);
+    TEST_ASSERT_TRUE(a.from_host && a.has_cmd);
+    TEST_ASSERT_EQUAL_INT(JCMD_TARGET, a.cmd_out.op);
+    TEST_ASSERT_EQUAL_FLOAT(0.1f, a.cmd_out.arg);
+    TEST_ASSERT_EQUAL_UINT8(0, a.set_faults);
+
+    f = frame(can_make_id(me, CMD_ENABLE), 0, 0);
+    a = can_dispatch(&f, me);
+    TEST_ASSERT_TRUE(a.has_cmd && a.clear_faults);
+    TEST_ASSERT_EQUAL_INT(JCMD_ENABLE, a.cmd_out.op);
+    TEST_ASSERT_EQUAL_INT8(1, a.can_control);
+
+    f = frame(can_make_id(me, CMD_DISABLE), 0, 0);
+    a = can_dispatch(&f, me);
+    TEST_ASSERT_EQUAL_INT(JCMD_DISABLE, a.cmd_out.op);
+    TEST_ASSERT_EQUAL_INT8(-1, a.can_control);
+
+    f = frame(can_make_id(me, CMD_HEARTBEAT), 0, 0); // refreshes the host timer, does nothing else
+    a = can_dispatch(&f, me);
+    TEST_ASSERT_TRUE(a.from_host && !a.has_cmd && !a.set_faults && !a.can_control);
+    TEST_ASSERT_EQUAL_UINT8(CMD_HEARTBEAT, a.cmd);
+
+    f = frame(can_make_id(2, CMD_ENABLE), 0, 0); // the hip's: not ours, not even a host frame
+    a = can_dispatch(&f, me);
+    TEST_ASSERT_TRUE(!a.from_host && !a.has_cmd && !a.set_faults);
+}
+
+static void test_can_dispatch_bad_frames(void) {
+    const uint8_t me = 1;
+    const can_frame_t bad[] = {
+        frame(can_make_id(me, CMD_SET_TARGET), 4, NAN),
+        frame(can_make_id(me, CMD_SET_TARGET), 4, INFINITY),
+        frame(can_make_id(me, CMD_SET_TARGET), 3, 0.1f), // short
+        frame(can_make_id(me, CMD_SET_VLIMIT), 8, 1.0f), // long
+        frame(can_make_id(me, 0x1F), 0, 0),              // unknown
+        frame(can_make_id(me, MSG_STATUS), 8, 0),        // a leg->host message sent to us
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        can_action_t a = can_dispatch(&bad[i], me);
+        TEST_ASSERT_TRUE(a.from_host); // still proves the host is alive
+        TEST_ASSERT_FALSE(a.has_cmd);  // never reaches the joint
+        TEST_ASSERT_EQUAL_UINT8(FAULT_BAD_FRAME, a.set_faults);
+    }
+}
+
+static void test_can_dispatch_estop(void) {
+    for (uint8_t dlc = 0; dlc <= 8; dlc += 8) {
+        can_frame_t f = frame(CAN_ID_ESTOP, dlc, 0);
+        can_action_t a = can_dispatch(&f, 1);
+        TEST_ASSERT_TRUE(a.has_cmd);
+        TEST_ASSERT_EQUAL_INT(JCMD_DISABLE, a.cmd_out.op);
+        TEST_ASSERT_EQUAL_UINT8(FAULT_ESTOP, a.set_faults);
+        TEST_ASSERT_EQUAL_INT8(-1, a.can_control);
+        TEST_ASSERT_FALSE(a.from_host); // an E-STOP can't keep a CAN-enabled leg alive
+    }
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_pid_step);
@@ -359,5 +427,8 @@ int main(void) {
     RUN_TEST(test_joint_pi_limit);
     RUN_TEST(test_joint_fault_zeroes_uq);
     RUN_TEST(test_joint_cfc_fallback_bumpless);
+    RUN_TEST(test_can_dispatch_commands);
+    RUN_TEST(test_can_dispatch_bad_frames);
+    RUN_TEST(test_can_dispatch_estop);
     return UNITY_END();
 }

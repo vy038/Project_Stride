@@ -24,6 +24,19 @@ typedef struct {
     pid_ctrl_t pid_vel;
 } joint_t;
 
+/**
+ * A request to the joint. Whoever doesn't own joint_t (superloop, CAN) queues these and the owner
+ * (PendSV) applies them with joint_apply, so the joint is never changed halfway through a step.
+ */
+typedef enum { JCMD_ENABLE, JCMD_DISABLE, JCMD_TARGET, JCMD_VLIMIT, JCMD_CFC } joint_cmd_op_t;
+typedef struct {
+    joint_cmd_op_t op;
+    float arg; // rad for TARGET, volts for VLIMIT, nonzero = on for CFC
+} joint_cmd_t;
+
+/** @return the joint_* call's result: 0 or -errno */
+int joint_apply(joint_t *j, const joint_cmd_t *c);
+
 void joint_init(joint_t *j, bool cfc_ok, bool enc_ok);
 
 void joint_step(joint_t *j, float angle, float vel);
