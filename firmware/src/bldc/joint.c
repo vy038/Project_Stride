@@ -101,6 +101,9 @@ void joint_disable(joint_t *j) {
 
 void joint_fault(joint_t *j, uint8_t fault_bits) {
     j->faults |= fault_bits;
+    // a lost encoder may mean a reseated connector or a moved magnet, so the old calibration
+    // can't be trusted: the next enable calibrates again (same as the bring-up)
+    if (fault_bits & FAULT_ENCODER_LOST) j->calibrated = false;
     j->state = JOINT_FAULT;
     j->uq = 0.0f;
 }

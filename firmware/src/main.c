@@ -52,7 +52,8 @@
 _Static_assert(!(OPENLOOP_TEST && COMMUTATE_TEST), "one motor test at a time");
 
 // temporary leg test, build with -DJOINT_TEST=1 (hold zero), 2 (also step +-0.15 rad through zero
-// every 2 s) or 3 (gravity sweep: hold -0.4..0.4..-0.4 rad, 3 s each, print the mean uq per angle). SUPPORT THE LEG: any fault drops the knee ~70 deg. enables 3 s after boot, off after 60 s
+// every 2 s) or 3 (gravity sweep: hold -0.4..0.4..-0.4 rad, 3 s each, print the mean uq per angle).
+// enables 3 s after boot, off after 60 s. SUPPORT THE LEG: any fault drops the knee ~70 deg
 #ifndef JOINT_TEST
 #define JOINT_TEST 0
 #endif
@@ -95,12 +96,13 @@ static volatile uint32_t period_min = UINT32_MAX, period_max;
 typedef struct {
     float angle; // rad
     uint32_t fails;
+    uint32_t lost_events; // counts up each time lost is raised, so a short outage can't be missed
     uint16_t raw;
     bool lost;
 } enc_telem_t;
 static enc_telem_t enc_telem;
 static seqlock_t enc_lock;
-static volatile uint32_t enc_lost_events, enc_start_max;
+static volatile uint32_t enc_start_max;
 
 // PendSV -> tick. the tick outranks PendSV, so a seqlock would spin forever if the tick caught a
 // write half done; PendSV masks interrupts for the copy instead. the tick just reads it
@@ -121,8 +123,12 @@ static ctrl_telem_t ctrl_telem;
 static seqlock_t ctrl_lock;
 static volatile uint32_t pendsv_count, pendsv_period_min = UINT32_MAX, pendsv_period_max, pendsv_max;
 
-// step-response recorder. PendSV appends one row per run, the superloop dumps it once full.
+// step-response recorder, leg-test builds only: the dump blocks the superloop for ~4 s, which
+// would starve CAN and trip the host timeout in a normal build.
+// PendSV appends one row per run, the superloop dumps it once full.
 // printing from PendSV would block it for ms per line and break the timing being measured
+#define RECORDER (JOINT_TEST != 0)
+#if RECORDER
 #define REC_N (4 * CFC_CTRL_HZ) // 4 s, 40 KB
 typedef struct {
     uint32_t n; // outer-loop runs since boot
@@ -130,6 +136,7 @@ typedef struct {
 } rec_row_t;
 static rec_row_t rec[REC_N];
 static volatile uint32_t rec_len; // REC_N means full and waiting to be dumped
+#endif
 
 void TIM2_IRQHandler(void) {
     static uint32_t last_entry;
@@ -161,7 +168,7 @@ void TIM2_IRQHandler(void) {
         e.fails++;             // includes a read still running a tick later
         if (fail_run < ENC_LOST_N && ++fail_run == ENC_LOST_N) {
             e.lost = true;
-            enc_lost_events++;
+            e.lost_events++;
         }
     }
     if (r != -EINPROGRESS) { // never start over a read that's still running
@@ -267,7 +274,13 @@ void PendSV_Handler(void) {
     seqlock_read(&enc_lock, &e, &enc_telem, sizeof e);
     static vel_t vs;
     float vel = isfinite(e.angle) ? vel_step(&vs, e.angle) : NAN;
-    if (e.lost) joint_fault(&joint, FAULT_ENCODER_LOST);
+    // only while driving, like the bring-up. the counter catches an outage that started and ended
+    // between two runs; while idle it's just followed, so an old outage can't fault a later enable
+    static uint32_t lost_seen;
+    bool driving = joint.state == JOINT_CALIBRATING || joint.state == JOINT_CLOSED_PID ||
+                   joint.state == JOINT_CLOSED_CFC;
+    if (driving && (e.lost || e.lost_events != lost_seen)) joint_fault(&joint, FAULT_ENCODER_LOST);
+    lost_seen = e.lost_events;
     joint_step(&joint, e.angle, vel);
 
     bool active = joint.state != JOINT_IDLE && joint.state != JOINT_FAULT;
@@ -281,6 +294,7 @@ void PendSV_Handler(void) {
                       .state = joint.state, .faults = joint.faults, .cmd_err = cmd_err};
     seqlock_write(&ctrl_lock, &ctrl_telem, &t, sizeof t);
 
+#if RECORDER
     // record from each start of closed loop until the buffer is full; dumping frees it again
     static bool was_closed;
     bool closed = joint.state == JOINT_CLOSED_PID || joint.state == JOINT_CLOSED_CFC;
@@ -290,6 +304,7 @@ void PendSV_Handler(void) {
         rec[rec_len - 1] = (rec_row_t){pendsv_count, e.angle, joint.vel_sp, vel, joint.uq};
         rec_len++;
     }
+#endif
 
 #if PENDSV_LOAD_US
     while (DWT->CYCCNT - entry < PENDSV_LOAD_US * (TIM_CLK_HZ / 1000000)) {}
@@ -343,7 +358,7 @@ static void SystemClock_Config(void) {
 }
 
 // pull both driver EN pins low before configuring anything
-// the other joint's EN mis JTAG NJTRST, so it idles high
+// the other joint's EN is JTAG NJTRST, so it idles high
 static void en_pin_low(void) {
     EN_PORT->BSRR = EN_ALL_RESET; // ODR bits low first (they reset to 0 anyway)
     GPIO_InitTypeDef g = {.Pin = (1u << EN_PIN) | (1u << OTHER_EN_PIN), .Mode = GPIO_MODE_OUTPUT_PP, .Speed = GPIO_SPEED_FREQ_LOW};
@@ -380,6 +395,7 @@ static long milli(float x) { return isfinite(x) ? lroundf(x * 1000.0f) : 0; }
 
 // dump the recorder as CSV once full. blocking is fine here, but keep kicking between lines
 static void rec_dump(void) {
+#if RECORDER
     if (rec_len <= REC_N) return;
     printf("rec: t_ms,angle_mrad,vel_sp_mrad_s,vel_mrad_s,uq_mv\r\n");
     for (uint32_t i = 0; i < REC_N; i++) {
@@ -390,6 +406,7 @@ static void rec_dump(void) {
     }
     printf("rec: end\r\n");
     rec_len = 0;
+#endif
 }
 
 // returns false if the ring is full (PendSV not running)
@@ -606,7 +623,7 @@ int main(void) {
                pendsv_period_max, pendsv_max);
         i2c_timing_t it = i2c_last_timing();
         printf("enc raw %u  noise %ld mcounts (%lu samples)  fails %lu  lost %d (%lu times)  recoveries %lu\r\n",
-               e.raw, milli(noise), n, e.fails, e.lost, enc_lost_events, i2c_recoveries);
+               e.raw, milli(noise), n, e.fails, e.lost, e.lost_events, i2c_recoveries);
         printf("i2c read %lu cyc, isr %lu cyc, start max %lu cyc\r\n", it.xfer_cycles, it.isr_cycles, enc_start_max);
 #if CAN_TEST >= 2
         {

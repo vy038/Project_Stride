@@ -23,8 +23,7 @@ void uart_init(void) {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_USART2_CLK_ENABLE();
 
-    // PA2 = USART2_TX, PA3 = USART2_RX, both alternate function 7 on the F401.
-    // Pull-up on RX keeps the idle line high if the ST-LINK is unplugged.
+    // PA2 tx, PA3 rx, AF7. pull-up keeps rx idle high if the ST-LINK is unplugged
     GPIO_InitTypeDef pins = {
         .Pin = GPIO_PIN_2 | GPIO_PIN_3,
         .Mode = GPIO_MODE_AF_PP,
@@ -47,8 +46,7 @@ void uart_init(void) {
         }
     }
 
-    // Unbuffered: each printf fragment goes straight to _write. Costs a few more
-    // small transmits, but avoids lost output if we reset or fault before a flush.
+    // unbuffered: nothing is lost if we fault before a flush, at the cost of more small transmits
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 
@@ -68,8 +66,7 @@ int _write(int fd, char *buf, int len) {
         return 0;
     }
 
-    // HAL_UART_Transmit takes a 16-bit size, so send in chunks rather than
-    // silently truncating a long write.
+    // HAL takes a 16-bit size, so chunk instead of silently truncating
     int sent = 0;
     while (sent < len) {
         int remaining = len - sent;

@@ -1,6 +1,6 @@
 /**
  * @file can_node.c
- * @brief CAN node: receive path, error housekeeping. See can_node.h.
+ * @brief CAN node: receive, dispatch, host timeout, STATUS/FEEDBACK, error housekeeping. See can_node.h.
  */
 
 #include "can/can_node.h"
@@ -24,9 +24,10 @@ static uint8_t node_faults, last_cmd = 0xFF;
 static bool can_control, heard_host;
 static uint32_t last_host_ms;
 
+// capped at one ring's worth, so a flooded bus can't keep the superloop (and the kick) in here
 static void drain(void) {
     can_frame_t f;
-    while (mcp2515_recv(&f) == 0) {
+    for (int n = 0; n < 32 && mcp2515_recv(&f) == 0; n++) {
         st.rx++;
         if (!ring_push(&rx, &f)) st.rx_dropped++;
     }

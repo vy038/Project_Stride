@@ -311,6 +311,8 @@ static void test_joint_fault_zeroes_uq(void) {
     TEST_ASSERT_EQUAL_FLOAT(0.0f, j.uq);
     joint_step(&j, 0.0f, 0.0f); // stays off with a good angle again
     TEST_ASSERT_EQUAL_FLOAT(0.0f, j.uq);
+    TEST_ASSERT_EQUAL_INT(0, joint_enable(&j)); // calibration is no longer trusted
+    TEST_ASSERT_EQUAL_INT(JOINT_CALIBRATING, j.state);
 
     j = joint_closed(0.0f);
     joint_step(&j, 0.0f, INFINITY);
